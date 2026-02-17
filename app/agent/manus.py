@@ -1,5 +1,7 @@
-from typing import Dict, List, Optional
-
+import asyncio
+import argparse
+import datetime
+from typing import Dict, List, Optional, Any
 from pydantic import Field, model_validator
 
 from app.agent.browser import BrowserContextHelper
@@ -13,10 +15,12 @@ from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
+from app.agent.bdi import BeliefSet, GoalSet, IntentionPool, Plan, Phase
+from app.schema import Message, ToolCall
 
 
 class Manus(ToolCallAgent):
-    """A versatile general-purpose agent with support for both local and MCP tools."""
+    """A BDI-based agent with support for both local and MCP tools."""
 
     name: str = "Manus"
     description: str = "A versatile agent that can solve various tasks using multiple tools including MCP-based tools"
@@ -26,6 +30,11 @@ class Manus(ToolCallAgent):
 
     max_observe: int = 10000
     max_steps: int = 20
+
+    # BDI Components
+    beliefs: BeliefSet = Field(default_factory=BeliefSet)
+    goals: GoalSet = Field(default_factory=GoalSet)
+    intentions: IntentionPool = Field(default_factory=IntentionPool)
 
     # MCP clients for remote tool access
     mcp_clients: MCPClients = Field(default_factory=MCPClients)
@@ -138,12 +147,41 @@ class Manus(ToolCallAgent):
             self._initialized = False
 
     async def think(self) -> bool:
-        """Process current state and decide next actions with appropriate context."""
+        """Process current state and decide next actions using BDI reasoning loop."""
         if not self._initialized:
             await self.initialize_mcp_servers()
             self._initialized = True
 
+        # 1. Perception: Update beliefs from observation/environment
+        # (This is simplified, could involve checking sandbox state, etc.)
+        # For now, we rely on previous tool outputs being in memory which act as observations.
+        if self.memory.messages and self.memory.messages[-1].role == "tool":
+            last_tool_output = self.memory.messages[-1].content
+            self.beliefs.update_from_observation(last_tool_output)
+
+        # 2. Deliberation: Decide on goals (Desires)
+        # If no active goal, derive one from the last user message or context
+        if not self.goals.active_goals and self.memory.messages:
+             last_user_msg = next((m for m in reversed(self.memory.messages) if m.role == "user"), None)
+             if last_user_msg:
+                 self.goals.add_goal(last_user_msg.content)
+                 self.goals.get_active_goal() # Activate it
+
+        # 3. Planning: Generate or Refine Plan (Intentions)
+        # We inject the current plan and beliefs into the prompt
+
+        bdi_context = f"""
+Current Beliefs:
+{self.beliefs.get_summary()}
+
+Current Plan:
+{self.intentions.current_plan.json() if self.intentions.current_plan else "No plan yet."}
+"""
+
         original_prompt = self.next_step_prompt
+        # Safely prepend BDI context
+        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}"
+
         recent_messages = self.memory.messages[-3:] if self.memory.messages else []
         browser_in_use = any(
             tc.function.name == BrowserUseTool().name
@@ -156,10 +194,24 @@ class Manus(ToolCallAgent):
             self.next_step_prompt = (
                 await self.browser_context_helper.format_next_step_prompt()
             )
+            # Re-append BDI context if it was overwritten
+            self.next_step_prompt += f"\n\n{bdi_context}"
 
-        result = await super().think()
 
-        # Restore original prompt
-        self.next_step_prompt = original_prompt
+        # Delegate to ToolCallAgent.think to interact with LLM and select tools
+        try:
+            result = await super().think()
+        finally:
+             # Restore original prompt even if exceptions occur
+             self.next_step_prompt = original_prompt
+
+        return result
+
+    async def act(self) -> str:
+        """Execute actions and update beliefs."""
+        result = await super().act()
+
+        # 5. Observation (Post-Act): Update beliefs with the result of the action
+        self.beliefs.update_from_observation(result)
 
         return result
