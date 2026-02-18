@@ -38,8 +38,12 @@ if daytona_config.target:
 else:
     logger.warning("No Daytona target found in environment variables")
 
-daytona = Daytona(daytona_config)
-logger.info("Daytona client initialized")
+try:
+    daytona = Daytona(daytona_config)
+    logger.info("Daytona client initialized")
+except Exception as e:
+    logger.warning(f"Failed to initialize Daytona client: {e}")
+    daytona = None
 
 
 async def get_or_start_sandbox(sandbox_id: str):

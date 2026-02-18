@@ -11,6 +11,7 @@ from app.agent.browser import BrowserContextHelper
 from app.agent.toolcall import ToolCallAgent
 from app.agent.reasoning import ReasoningEngine
 from app.agent.memory import ContextManager
+from app.agent.double_check import with_double_check
 from app.config import config
 from app.logger import logger
 from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
@@ -19,10 +20,11 @@ from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
 from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.mcp import MCPClients, MCPClientTool
+from app.tool.planning import PlanningTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
 from app.agent.bdi import BeliefSet, GoalSet, IntentionPool, Plan, Phase
-
+from app.tool.bash import Bash
 
 class Manus(ToolCallAgent):
     """A BDI-based agent with support for both local and MCP tools."""
@@ -45,11 +47,17 @@ class Manus(ToolCallAgent):
     reasoning_engine: Optional[ReasoningEngine] = None
     context_manager: Optional[ContextManager] = None
 
+    # Error Learning Context
+    error_logs: List[str] = Field(default_factory=list)
+
     # Persistence
     session_id: str = Field(default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
 
     # MCP clients for remote tool access
     mcp_clients: MCPClients = Field(default_factory=MCPClients)
+
+    # Bash tool reference for double-check executor
+    _bash_tool: Optional[Bash] = None
 
     # Add general-purpose tools to the tool collection
     available_tools: ToolCollection = Field(
@@ -59,6 +67,7 @@ class Manus(ToolCallAgent):
             StrReplaceEditor(),
             AskHuman(),
             Terminate(),
+            PlanningTool(),
         )
     )
 
@@ -78,6 +87,12 @@ class Manus(ToolCallAgent):
         if hasattr(self, 'llm') and self.llm:
              self.reasoning_engine = ReasoningEngine(self.llm)
              self.context_manager = ContextManager(self.llm)
+
+        # Inject intention pool into PlanningTool
+        for tool in self.available_tools.tools:
+            if isinstance(tool, PlanningTool):
+                tool.intention_pool = self.intentions
+                break
         return self
 
     @classmethod
@@ -86,6 +101,39 @@ class Manus(ToolCallAgent):
         instance = cls(**kwargs)
         await instance.initialize_mcp_servers()
         instance._initialized = True
+
+        # Initialize helper tools if needed (e.g. Bash for double-check)
+        # Check if Bash is in tools, if not add it or create one for internal use
+        bash_tool = next((t for t in instance.available_tools.tools if isinstance(t, Bash) or t.name == 'bash'), None)
+        if not bash_tool:
+             # Create one if not available (e.g. for verification)
+             # Note: If environment doesn't support bash, this might be an issue.
+             # Assuming standard environment supports it.
+             # Ideally we should use PythonExecute as fallback but let's stick to Bash for now.
+             try:
+                 bash_tool = Bash()
+                 # We don't necessarily add it to available_tools if it wasn't there by default,
+                 # but we use it for verification.
+             except Exception:
+                 pass
+
+        instance._bash_tool = bash_tool
+
+        # Wrap critical tools with Double-Check
+        # Identify tools that need wrapping (e.g. Bash, StrReplaceEditor)
+        # Note: If we modify available_tools here, we need to be careful about reference updates.
+        new_tools = []
+        for tool in instance.available_tools.tools:
+            if tool.name in ['bash', 'terminal', 'str_replace_editor'] and instance._bash_tool:
+                 # Wrap it
+                 wrapped = with_double_check(tool, executor=instance._bash_tool)
+                 new_tools.append(wrapped)
+            else:
+                 new_tools.append(tool)
+
+        instance.available_tools.tools = tuple(new_tools)
+        instance.available_tools.tool_map = {t.name: t for t in new_tools}
+
         if instance.llm:
              if not instance.reasoning_engine:
                 instance.reasoning_engine = ReasoningEngine(instance.llm)
@@ -236,8 +284,15 @@ Current Goals:
             reasoning_result = await self.reasoning_engine.decide_strategy(context_for_reasoning)
             reasoning_strategy_output = f"\n\nReasoning Engine Output:\n{reasoning_result}"
 
+        # Add Error Logs to Context (Chapter 7.6)
+        error_context = ""
+        if self.error_logs:
+            # Show last 3 errors to keep context focused
+            recent_errors = "\n".join(self.error_logs[-3:])
+            error_context = f"\n\n[Recent Errors & Fixes]\n{recent_errors}\n(Use this information to avoid repeating mistakes)"
+
         original_prompt = self.next_step_prompt
-        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}"
+        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}{error_context}"
 
         recent_messages = self.memory.messages[-3:] if self.memory.messages else []
         browser_in_use = any(
@@ -250,7 +305,7 @@ Current Goals:
         if browser_in_use:
             browser_prompt = await self.browser_context_helper.format_next_step_prompt()
             if browser_prompt:
-                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}{reasoning_strategy_output}"
+                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}{reasoning_strategy_output}{error_context}"
 
         try:
             # Delegate to ToolCallAgent.think to interact with LLM and select tools
@@ -268,6 +323,18 @@ Current Goals:
 
         # 5. Observation (Post-Act): Update beliefs with the result of the action
         self.beliefs.update_from_observation(result)
+
+        # Check for tool failures in history to update error logs
+        # Since act() returns a string, we might need to inspect memory or result.
+        # ToolCallAgent.act already logs failures to memory as tool messages.
+        # We can scan the last tool message for errors.
+        if self.memory.messages:
+             last_msg = self.memory.messages[-1]
+             if last_msg.role == "tool" and "Error:" in (last_msg.content or ""):
+                 # It's a failure. Log it.
+                 # In a real system we would extract the command args too.
+                 error_entry = f"Step {len(self.memory.messages)}: {last_msg.content[:200]}"
+                 self.error_logs.append(error_entry)
 
         # 6. Evaluate Progress
         if self.goals.is_satisfied(self.beliefs):
@@ -293,14 +360,16 @@ Current Goals:
             "plan": self.intentions.current_plan.model_dump() if self.intentions.current_plan else None,
             "beliefs": self.beliefs.model_dump(),
             "goals": self.goals.model_dump(),
+            "error_logs": self.error_logs,
             # "sandbox_id": "..." # If we had one
         }
 
         try:
-            # Using async file write would be better but standard json lib is sync
-            # For simplicity in this iteration:
-            with open(filepath, 'w') as f:
-                json.dump(state_data, f, indent=2, default=str)
+            def write_file():
+                with open(filepath, 'w') as f:
+                    json.dump(state_data, f, indent=2, default=str)
+
+            await asyncio.to_thread(write_file)
             logger.info(f"Session state saved to {filepath}")
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
@@ -330,6 +399,8 @@ Current Goals:
                 self.goals = GoalSet(**state_data["goals"])
             if "plan" in state_data and state_data["plan"]:
                 self.intentions.set_plan(Plan(**state_data["plan"]))
+            if "error_logs" in state_data:
+                self.error_logs = state_data["error_logs"]
 
             logger.info(f"Session state loaded from {filepath}")
         except Exception as e:

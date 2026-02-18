@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Union, Dict
 
 from pydantic import Field
 
@@ -11,6 +11,8 @@ from app.logger import logger
 from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
+from app.tool.base import ToolResult, ToolFailure
+from app.tool.ask_human import AskHuman
 
 
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
@@ -37,11 +39,28 @@ class ToolCallAgent(ReActAgent):
     max_steps: int = 30
     max_observe: Optional[Union[int, bool]] = None
 
+    # Self-Correction tracking
+    consecutive_failures: int = 0
+    max_consecutive_failures: int = 3
+
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
         if self.next_step_prompt:
             user_msg = Message.user_message(self.next_step_prompt)
             self.messages += [user_msg]
+
+        # Check for max failures threshold
+        if self.consecutive_failures >= self.max_consecutive_failures:
+             logger.warning(f"Reaching max consecutive failures ({self.consecutive_failures}). Triggering AskHuman.")
+             self.memory.add_message(Message.assistant_message(
+                 "I have encountered repeated errors and cannot proceed. I will ask the user for guidance."
+             ))
+             # Force usage of AskHuman if available
+             # In this architecture, we can inject a tool call directly or prompt the LLM to ask.
+             # Prompting LLM is safer to maintain flow.
+             self.next_step_prompt += f"\n\nCRITICAL: You have failed {self.consecutive_failures} times consecutively. You MUST use the 'ask_human' tool to request help from the user. Explain the errors you faced."
+             self.consecutive_failures = 0 # Reset after prompting, or keep high to force loop?
+             # Resetting to 0 to allow the user to answer and then we try again.
 
         try:
             # Get response with tool options
@@ -145,36 +164,43 @@ class ToolCallAgent(ReActAgent):
 
         results = await asyncio.gather(*tasks)
 
+        outputs = []
+        has_failure = False
         for i, command in enumerate(self.tool_calls):
-            result = results[i]
-            if self.max_observe:
-                result = result[: self.max_observe]
+            result: ToolResult = results[i]
+
+            # Check for failure
+            if result.error:
+                has_failure = True
+                logger.warning(f"Tool {command.function.name} failed: {result.error}")
+                # Add failure to context for self-correction learning
+                error_context = f"Tool Failure ({command.function.name}): {result.error}\nAttempted Args: {command.function.arguments}"
+                # In a real system, we'd log this specifically to an error memory or similar
+
+            output_str = str(result.output) if result.output else (f"Error: {result.error}" if result.error else "")
+            if self.max_observe and len(output_str) > self.max_observe:
+                output_str = output_str[: self.max_observe]
 
             logger.info(
-                f"🎯 Tool '{command.function.name}' completed its mission! Result: {result}"
+                f"🎯 Tool '{command.function.name}' completed its mission! Result: {output_str[:100]}..."
             )
-
-            # Add tool response to memory
-            # Note: We need to handle base64 images if they were returned.
-            # execute_tool returns a string, but stores base64 in self._current_base64_image
-            # Parallel execution complicates this as self._current_base64_image is shared state.
-            # We should refactor execute_tool to return the full result object or modify how image is stored.
-            # For strict Chapter 5 compliance (robustness), we assume execute_tool handles the specific return.
-            # But currently execute_tool returns a string observation.
-
-            # Since execute_tool is now running in parallel, updating self._current_base64_image is not thread-safe/async-safe context-wise.
-            # However, for now, we will stick to the existing tool message structure.
-            # Ideally execute_tool should return a structured object.
 
             tool_msg = Message.tool_message(
-                content=result,
+                content=output_str,
                 tool_call_id=command.id,
                 name=command.function.name,
-                # base64_image=self._current_base64_image, # Temporarily disabled for parallel safety or need refactor
+                base64_image=result.base64_image,
             )
             self.memory.add_message(tool_msg)
+            outputs.append(output_str)
 
-        return "\n\n".join(results)
+        # Update failure counter
+        if has_failure:
+            self.consecutive_failures += 1
+        else:
+            self.consecutive_failures = 0
+
+        return "\n\n".join(outputs)
 
     def _sanitize_command(self, name: str, args: dict) -> bool:
         """Sanitize tool arguments (Security Layer)."""
@@ -188,14 +214,14 @@ class ToolCallAgent(ReActAgent):
                     return False
         return True
 
-    async def execute_tool(self, command: ToolCall) -> str:
+    async def execute_tool(self, command: ToolCall) -> ToolResult:
         """Execute a single tool call with robust error handling and sanitization"""
         if not command or not command.function or not command.function.name:
-            return "Error: Invalid command format"
+            return ToolResult(error="Invalid command format")
 
         name = command.function.name
         if name not in self.available_tools.tool_map:
-            return f"Error: Unknown tool '{name}'"
+            return ToolResult(error=f"Unknown tool '{name}'")
 
         try:
             # Parse arguments
@@ -203,48 +229,39 @@ class ToolCallAgent(ReActAgent):
 
             # Sanitization Step
             if not self._sanitize_command(name, args):
-                return f"Error: Command blocked by security policy."
+                return ToolResult(error="Command blocked by security policy.")
 
             # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")
 
-            # File Offloading Check (Section 5.5) happens inside specific tools or here if result is huge.
-            # We execute first.
             result = await self.available_tools.execute(name=name, tool_input=args)
 
-            # Handle special tools
-            await self._handle_special_tool(name=name, result=result)
+            # Normalize result to ToolResult
+            if not isinstance(result, ToolResult):
+                 result = ToolResult(output=str(result))
 
-            # Check if result is a ToolResult with base64_image
-            # Note: In parallel execution, setting self._current_base64_image here is race-condition prone.
-            # Ideally we return a complex object. For now we just return the text representation.
-            if hasattr(result, "base64_image") and result.base64_image:
-                # self._current_base64_image = result.base64_image
-                pass
+            # Handle special tools
+            await self._handle_special_tool(name=name, result=result.output)
 
             # Format result for display (standard case)
-            observation = str(result) if result else f"Cmd `{name}` completed with no output"
+            observation = str(result.output) if result.output else f"Cmd `{name}` completed with no output"
 
             # Output Handling (Truncation/Offloading) - Section 5.5
             if len(observation) > 5000:
                 # Truncate
-                observation = observation[:5000] + "\n... [Output Truncated]"
-                # In a real implementation, we would save to file here:
-                # filename = f"output_{command.id}.txt"
-                # with open(filename, "w") as f: f.write(str(result))
-                # observation = f"Output too large. Saved to {filename}"
+                result.output = observation[:5000] + "\n... [Output Truncated]"
 
-            return observation
+            return result
         except json.JSONDecodeError:
             error_msg = f"Error parsing arguments for {name}: Invalid JSON format"
             logger.error(
                 f"📝 Oops! The arguments for '{name}' don't make sense - invalid JSON, arguments:{command.function.arguments}"
             )
-            return f"Error: {error_msg}"
+            return ToolResult(error=error_msg)
         except Exception as e:
             error_msg = f"⚠️ Tool '{name}' encountered a problem: {str(e)}"
             logger.exception(error_msg)
-            return f"Error: {error_msg}"
+            return ToolResult(error=error_msg)
 
     async def _handle_special_tool(self, name: str, result: Any, **kwargs):
         """Handle special tool execution and state changes"""
