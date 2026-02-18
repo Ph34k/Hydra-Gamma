@@ -10,6 +10,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 from app.agent.browser import BrowserContextHelper
 from app.agent.toolcall import ToolCallAgent
 from app.agent.reasoning import ReasoningEngine
+from app.agent.memory import ContextManager
 from app.config import config
 from app.logger import logger
 from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
@@ -40,8 +41,9 @@ class Manus(ToolCallAgent):
     goals: GoalSet = Field(default_factory=GoalSet)
     intentions: IntentionPool = Field(default_factory=IntentionPool)
 
-    # Reasoning Engine
+    # Reasoning & Memory
     reasoning_engine: Optional[ReasoningEngine] = None
+    context_manager: Optional[ContextManager] = None
 
     # Persistence
     session_id: str = Field(default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
@@ -73,11 +75,9 @@ class Manus(ToolCallAgent):
     def initialize_helper(self) -> "Manus":
         """Initialize basic components synchronously."""
         self.browser_context_helper = BrowserContextHelper(self)
-        # We can't init reasoning engine here because LLM might not be ready or we want to use self.llm which is set in BaseAgent
-        # BaseAgent initializes self.llm in model_validator(mode='after') too.
-        # Since this runs after validation, self.llm should be available if inherited correctly.
-        if hasattr(self, 'llm'):
+        if hasattr(self, 'llm') and self.llm:
              self.reasoning_engine = ReasoningEngine(self.llm)
+             self.context_manager = ContextManager(self.llm)
         return self
 
     @classmethod
@@ -86,8 +86,11 @@ class Manus(ToolCallAgent):
         instance = cls(**kwargs)
         await instance.initialize_mcp_servers()
         instance._initialized = True
-        if not instance.reasoning_engine and instance.llm:
-             instance.reasoning_engine = ReasoningEngine(instance.llm)
+        if instance.llm:
+             if not instance.reasoning_engine:
+                instance.reasoning_engine = ReasoningEngine(instance.llm)
+             if not instance.context_manager:
+                instance.context_manager = ContextManager(instance.llm)
         return instance
 
     async def initialize_mcp_servers(self) -> None:
@@ -191,9 +194,15 @@ class Manus(ToolCallAgent):
             await self.initialize_mcp_servers()
             self._initialized = True
 
-        # Ensure reasoning engine is initialized
+        # Ensure helper components are initialized
         if not self.reasoning_engine and self.llm:
              self.reasoning_engine = ReasoningEngine(self.llm)
+        if not self.context_manager and self.llm:
+             self.context_manager = ContextManager(self.llm)
+
+        # 0. Context Management
+        if self.context_manager:
+            await self.context_manager.manage_context(self.memory)
 
         # 1. Perception: Update beliefs from environment
         snapshot = self._get_environment_snapshot()
@@ -223,7 +232,6 @@ Current Goals:
         # Apply Reasoning Strategy
         reasoning_strategy_output = ""
         if self.reasoning_engine:
-            # We use the current context + last message to decide strategy
             context_for_reasoning = f"{bdi_context}\n\nLast User Message: {self.memory.messages[-1].content if self.memory.messages else ''}"
             reasoning_result = await self.reasoning_engine.decide_strategy(context_for_reasoning)
             reasoning_strategy_output = f"\n\nReasoning Engine Output:\n{reasoning_result}"
