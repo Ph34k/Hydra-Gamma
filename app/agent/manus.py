@@ -9,6 +9,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 
 from app.agent.browser import BrowserContextHelper
 from app.agent.toolcall import ToolCallAgent
+from app.agent.reasoning import ReasoningEngine
 from app.config import config
 from app.logger import logger
 from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
@@ -38,6 +39,9 @@ class Manus(ToolCallAgent):
     beliefs: BeliefSet = Field(default_factory=BeliefSet)
     goals: GoalSet = Field(default_factory=GoalSet)
     intentions: IntentionPool = Field(default_factory=IntentionPool)
+
+    # Reasoning Engine
+    reasoning_engine: Optional[ReasoningEngine] = None
 
     # Persistence
     session_id: str = Field(default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
@@ -69,6 +73,11 @@ class Manus(ToolCallAgent):
     def initialize_helper(self) -> "Manus":
         """Initialize basic components synchronously."""
         self.browser_context_helper = BrowserContextHelper(self)
+        # We can't init reasoning engine here because LLM might not be ready or we want to use self.llm which is set in BaseAgent
+        # BaseAgent initializes self.llm in model_validator(mode='after') too.
+        # Since this runs after validation, self.llm should be available if inherited correctly.
+        if hasattr(self, 'llm'):
+             self.reasoning_engine = ReasoningEngine(self.llm)
         return self
 
     @classmethod
@@ -77,6 +86,8 @@ class Manus(ToolCallAgent):
         instance = cls(**kwargs)
         await instance.initialize_mcp_servers()
         instance._initialized = True
+        if not instance.reasoning_engine and instance.llm:
+             instance.reasoning_engine = ReasoningEngine(instance.llm)
         return instance
 
     async def initialize_mcp_servers(self) -> None:
@@ -169,32 +180,26 @@ class Manus(ToolCallAgent):
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type((TimeoutError, Exception))
-        # Note: Specific exceptions should be imported or defined.
-        # For simplicity, catching generic Exception here as LLM clients raise various errors.
-        # Ideally, this retry should wrap the LLM call itself (in app.llm.LLM), but requested in Orchestrator.
     )
     async def think_with_retry(self) -> bool:
         """Wrapper for think with retry logic."""
-        # This calls the parent's think method logic (via super in think) indirectly.
-        # But wait, self.think() calls super().think().
-        # If we wrap think(), we are retrying the whole thought process.
         return await super().think()
 
     async def think(self) -> bool:
-        """Process current state and decide next actions using BDI reasoning loop."""
+        """Process current state and decide next actions using BDI reasoning loop and Reasoning Engine."""
         if not self._initialized:
             await self.initialize_mcp_servers()
             self._initialized = True
+
+        # Ensure reasoning engine is initialized
+        if not self.reasoning_engine and self.llm:
+             self.reasoning_engine = ReasoningEngine(self.llm)
 
         # 1. Perception: Update beliefs from environment
         snapshot = self._get_environment_snapshot()
         self.beliefs.sync_with_environment(snapshot)
 
-        # NOTE: We removed the redundant update_from_observation here because act() already handles it.
-        # This prevents duplicate facts.
-
         # 2. Deliberation: Decide on goals (Desires)
-        # If no active goal, derive one from the last user message or context
         if not self.goals.active_goals and self.memory.messages:
              last_user_msg = next((m for m in reversed(self.memory.messages) if m.role == "user"), None)
              if last_user_msg:
@@ -202,9 +207,6 @@ class Manus(ToolCallAgent):
                  self.goals.get_active_goal() # Activate it
 
         # 3. Planning: Generate or Refine Plan (Intentions)
-        # We inject the current plan and beliefs into the prompt
-
-        # Ensure we don't have None values in JSON generation
         current_plan_json = self.intentions.current_plan.model_dump_json() if self.intentions.current_plan else "No plan yet."
         active_goals_desc = [g.description for g in self.goals.active_goals]
 
@@ -218,9 +220,16 @@ Current Plan:
 Current Goals:
 {active_goals_desc}
 """
+        # Apply Reasoning Strategy
+        reasoning_strategy_output = ""
+        if self.reasoning_engine:
+            # We use the current context + last message to decide strategy
+            context_for_reasoning = f"{bdi_context}\n\nLast User Message: {self.memory.messages[-1].content if self.memory.messages else ''}"
+            reasoning_result = await self.reasoning_engine.decide_strategy(context_for_reasoning)
+            reasoning_strategy_output = f"\n\nReasoning Engine Output:\n{reasoning_result}"
 
         original_prompt = self.next_step_prompt
-        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}"
+        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}"
 
         recent_messages = self.memory.messages[-3:] if self.memory.messages else []
         browser_in_use = any(
@@ -233,7 +242,7 @@ Current Goals:
         if browser_in_use:
             browser_prompt = await self.browser_context_helper.format_next_step_prompt()
             if browser_prompt:
-                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}"
+                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}{reasoning_strategy_output}"
 
         try:
             # Delegate to ToolCallAgent.think to interact with LLM and select tools
