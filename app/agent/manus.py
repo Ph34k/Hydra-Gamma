@@ -1,6 +1,7 @@
 import asyncio
 import argparse
 import datetime
+import os
 from typing import Dict, List, Optional, Any
 from pydantic import Field, model_validator
 
@@ -9,6 +10,7 @@ from app.agent.toolcall import ToolCallAgent
 from app.config import config
 from app.logger import logger
 from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
+from app.schema import AgentState
 from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
 from app.tool.browser_use_tool import BrowserUseTool
@@ -146,18 +148,31 @@ class Manus(ToolCallAgent):
             await self.disconnect_mcp_server()
             self._initialized = False
 
+    def _get_environment_snapshot(self) -> Dict[str, Any]:
+        """Capture the current state of the environment."""
+        snapshot = {}
+        try:
+            snapshot["pwd"] = os.getcwd()
+            # Limit to 20 files for context to avoid huge prompts
+            snapshot["ls"] = os.listdir(os.getcwd())[:20]
+            # Only capture relevant environment variables
+            snapshot["env"] = {k: v for k, v in os.environ.items() if k in ["USER", "HOME", "PATH", "LANG"]}
+        except Exception as e:
+            logger.error(f"Failed to get environment snapshot: {e}")
+        return snapshot
+
     async def think(self) -> bool:
         """Process current state and decide next actions using BDI reasoning loop."""
         if not self._initialized:
             await self.initialize_mcp_servers()
             self._initialized = True
 
-        # 1. Perception: Update beliefs from observation/environment
-        # (This is simplified, could involve checking sandbox state, etc.)
-        # For now, we rely on previous tool outputs being in memory which act as observations.
-        if self.memory.messages and self.memory.messages[-1].role == "tool":
-            last_tool_output = self.memory.messages[-1].content
-            self.beliefs.update_from_observation(last_tool_output)
+        # 1. Perception: Update beliefs from environment
+        snapshot = self._get_environment_snapshot()
+        self.beliefs.sync_with_environment(snapshot)
+
+        # NOTE: We removed the redundant update_from_observation here because act() already handles it.
+        # This prevents duplicate facts.
 
         # 2. Deliberation: Decide on goals (Desires)
         # If no active goal, derive one from the last user message or context
@@ -170,16 +185,22 @@ class Manus(ToolCallAgent):
         # 3. Planning: Generate or Refine Plan (Intentions)
         # We inject the current plan and beliefs into the prompt
 
+        # Ensure we don't have None values in JSON generation
+        current_plan_json = self.intentions.current_plan.model_dump_json() if self.intentions.current_plan else "No plan yet."
+        active_goals_desc = [g.description for g in self.goals.active_goals]
+
         bdi_context = f"""
 Current Beliefs:
 {self.beliefs.get_summary()}
 
 Current Plan:
-{self.intentions.current_plan.json() if self.intentions.current_plan else "No plan yet."}
+{current_plan_json}
+
+Current Goals:
+{active_goals_desc}
 """
 
         original_prompt = self.next_step_prompt
-        # Safely prepend BDI context
         self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}"
 
         recent_messages = self.memory.messages[-3:] if self.memory.messages else []
@@ -191,27 +212,31 @@ Current Plan:
         )
 
         if browser_in_use:
-            self.next_step_prompt = (
-                await self.browser_context_helper.format_next_step_prompt()
-            )
-            # Re-append BDI context if it was overwritten
-            self.next_step_prompt += f"\n\n{bdi_context}"
+            browser_prompt = await self.browser_context_helper.format_next_step_prompt()
+            if browser_prompt:
+                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}"
 
-
-        # Delegate to ToolCallAgent.think to interact with LLM and select tools
         try:
+            # Delegate to ToolCallAgent.think to interact with LLM and select tools
             result = await super().think()
         finally:
-             # Restore original prompt even if exceptions occur
              self.next_step_prompt = original_prompt
 
         return result
 
     async def act(self) -> str:
         """Execute actions and update beliefs."""
+        # 4. Execution
         result = await super().act()
 
         # 5. Observation (Post-Act): Update beliefs with the result of the action
         self.beliefs.update_from_observation(result)
+
+        # 6. Evaluate Progress
+        if self.goals.is_satisfied(self.beliefs):
+            logger.info("All active goals satisfied. Terminating agent.")
+            self.state = AgentState.FINISHED
+            self.memory.add_message(Message.assistant_message("Task Completed"))
+            return "Task Completed"
 
         return result
