@@ -2,15 +2,17 @@ import asyncio
 import argparse
 import datetime
 import os
+import json
 from typing import Dict, List, Optional, Any
 from pydantic import Field, model_validator
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 from app.agent.browser import BrowserContextHelper
 from app.agent.toolcall import ToolCallAgent
 from app.config import config
 from app.logger import logger
 from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
-from app.schema import AgentState
+from app.schema import AgentState, Message, ToolCall
 from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
 from app.tool.browser_use_tool import BrowserUseTool
@@ -18,7 +20,6 @@ from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
 from app.agent.bdi import BeliefSet, GoalSet, IntentionPool, Plan, Phase
-from app.schema import Message, ToolCall
 
 
 class Manus(ToolCallAgent):
@@ -37,6 +38,9 @@ class Manus(ToolCallAgent):
     beliefs: BeliefSet = Field(default_factory=BeliefSet)
     goals: GoalSet = Field(default_factory=GoalSet)
     intentions: IntentionPool = Field(default_factory=IntentionPool)
+
+    # Persistence
+    session_id: str = Field(default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
 
     # MCP clients for remote tool access
     mcp_clients: MCPClients = Field(default_factory=MCPClients)
@@ -161,6 +165,21 @@ class Manus(ToolCallAgent):
             logger.error(f"Failed to get environment snapshot: {e}")
         return snapshot
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((TimeoutError, Exception))
+        # Note: Specific exceptions should be imported or defined.
+        # For simplicity, catching generic Exception here as LLM clients raise various errors.
+        # Ideally, this retry should wrap the LLM call itself (in app.llm.LLM), but requested in Orchestrator.
+    )
+    async def think_with_retry(self) -> bool:
+        """Wrapper for think with retry logic."""
+        # This calls the parent's think method logic (via super in think) indirectly.
+        # But wait, self.think() calls super().think().
+        # If we wrap think(), we are retrying the whole thought process.
+        return await super().think()
+
     async def think(self) -> bool:
         """Process current state and decide next actions using BDI reasoning loop."""
         if not self._initialized:
@@ -218,7 +237,8 @@ Current Goals:
 
         try:
             # Delegate to ToolCallAgent.think to interact with LLM and select tools
-            result = await super().think()
+            # Use retry logic for resilience
+            result = await self.think_with_retry()
         finally:
              self.next_step_prompt = original_prompt
 
@@ -239,4 +259,61 @@ Current Goals:
             self.memory.add_message(Message.assistant_message("Task Completed"))
             return "Task Completed"
 
+        # Save state after each step
+        await self.save_state()
+
         return result
+
+    async def save_state(self, filepath: Optional[str] = None) -> None:
+        """Serialize and save the agent's state to a file."""
+        if not filepath:
+            filepath = f"session_{self.session_id}.json"
+
+        state_data = {
+            "session_id": self.session_id,
+            "status": self.state.value if hasattr(self.state, "value") else str(self.state),
+            "history": [msg.model_dump() for msg in self.memory.messages],
+            "plan": self.intentions.current_plan.model_dump() if self.intentions.current_plan else None,
+            "beliefs": self.beliefs.model_dump(),
+            "goals": self.goals.model_dump(),
+            # "sandbox_id": "..." # If we had one
+        }
+
+        try:
+            # Using async file write would be better but standard json lib is sync
+            # For simplicity in this iteration:
+            with open(filepath, 'w') as f:
+                json.dump(state_data, f, indent=2, default=str)
+            logger.info(f"Session state saved to {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    async def load_state(self, filepath: Optional[str] = None) -> None:
+        """Load agent state from a file."""
+        if not filepath:
+            filepath = f"session_{self.session_id}.json"
+
+        try:
+            if not os.path.exists(filepath):
+                logger.warning(f"State file {filepath} not found.")
+                return
+
+            with open(filepath, 'r') as f:
+                state_data = json.load(f)
+
+            self.session_id = state_data.get("session_id", self.session_id)
+            # Restore history
+            if "history" in state_data:
+                self.memory.messages = [Message(**msg) for msg in state_data["history"]]
+
+            # Restore BDI components
+            if "beliefs" in state_data:
+                self.beliefs = BeliefSet(**state_data["beliefs"])
+            if "goals" in state_data:
+                self.goals = GoalSet(**state_data["goals"])
+            if "plan" in state_data and state_data["plan"]:
+                self.intentions.set_plan(Plan(**state_data["plan"]))
+
+            logger.info(f"Session state loaded from {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
