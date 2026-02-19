@@ -31,6 +31,12 @@ from app.memory.state import StateMonitor, AtomicState
 from app.metrics.performance import PerformanceMonitor
 from app.tool.memory import MemorySearchTool
 
+# New Intelligence & Architecture Components
+from app.agent.router import Router, TaskPhase
+from app.agent.budget import BudgetManager
+from app.tool.shell_tool import ShellTool
+from app.tool.file_tool import AtomicFileTool
+
 
 class Manus(ToolCallAgent):
     """A BDI-based agent with support for both local and MCP tools."""
@@ -58,6 +64,10 @@ class Manus(ToolCallAgent):
     state_monitor: Optional[StateMonitor] = None
     performance_monitor: Optional[PerformanceMonitor] = None
 
+    # Intelligence Components
+    router: Optional[Router] = None
+    budget_manager: Optional[BudgetManager] = None
+
     # Reasoning & Memory
     reasoning_engine: Optional[ReasoningEngine] = None
     context_manager: Optional[ContextManager] = None
@@ -77,6 +87,7 @@ class Manus(ToolCallAgent):
             AskHuman(),
             Terminate(),
             MemorySearchTool(), # Add Memory Search Tool
+            ShellTool(), # New Shell Tool
         )
     )
 
@@ -104,9 +115,11 @@ class Manus(ToolCallAgent):
         self.state_monitor = StateMonitor()
         self.performance_monitor = PerformanceMonitor()
 
+        # Initialize Intelligence
+        self.router = Router()
+        self.budget_manager = BudgetManager(limits={"default": 100.0}) # Example limit
+
         # Initialize Memories (Lazy load handled inside classes, but we init wrappers here)
-        # Note: These init DB connections, so we might want to do it in create/async if possible,
-        # but the constructors are sync currently.
         try:
             self.semantic_memory = SemanticMemory()
             self.episodic_store = EpisodicStore()
@@ -256,6 +269,14 @@ class Manus(ToolCallAgent):
         if self.context_manager:
             await self.context_manager.manage_context(self.memory)
 
+        # 0.5 Check Budget (with dummy cost for now)
+        if self.budget_manager:
+            try:
+                # Estimate a cost per step
+                self.budget_manager.check_budget("default", 0.05)
+            except Exception as e:
+                logger.warning(f"Budget check failed: {e}")
+
         # 1. Perception: Update beliefs from environment
         # Chapter 11: Heartbeat / State Synchronization
         if self.state_monitor and self.state_monitor.check_heartbeat():
@@ -317,6 +338,21 @@ Current Plan:
             reasoning_result = await self.reasoning_engine.decide_strategy(context_for_reasoning)
             reasoning_strategy_output = f"\n\nReasoning Engine Output:\n{reasoning_result}"
 
+        # Determine Model Tier using Router
+        if self.router:
+            # Simple mapping from plan phase to task phase
+            phase = TaskPhase.PLANNING # Default
+            if self.intentions.current_phase == Phase.PERCEPTION:
+                phase = TaskPhase.PLANNING
+            elif self.intentions.current_phase == Phase.ACTION:
+                phase = TaskPhase.CODING # Assumption
+
+            # Use self.session_id for task_id
+            selected_tier = self.router.route(phase, len(bdi_context), self.session_id)
+            logger.info(f"Router selected model tier: {selected_tier}")
+            # Note: Actual model switching logic would require updating self.llm config here.
+            # self.llm.switch_model(selected_tier.value)
+
         original_prompt = self.next_step_prompt
         self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}"
 
@@ -364,6 +400,11 @@ Current Plan:
             result = f"Error: {str(e)}"
             success = False
             error_msg = str(e)
+
+            # Report failure to Router
+            if self.router:
+                self.router.report_failure(self.session_id)
+
             raise e # Re-raise after logging? super().act() catches exceptions in execute_tool usually
 
         duration = time.time() - start_time
