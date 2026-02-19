@@ -2,37 +2,9 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.utils.logger import logger
-
-
-# class BaseTool(ABC, BaseModel):
-#     name: str
-#     description: str
-#     parameters: Optional[dict] = None
-
-#     class Config:
-#         arbitrary_types_allowed = True
-
-#     async def __call__(self, **kwargs) -> Any:
-#         """Execute the tool with given parameters."""
-#         return await self.execute(**kwargs)
-
-#     @abstractmethod
-#     async def execute(self, **kwargs) -> Any:
-#         """Execute the tool with given parameters."""
-
-#     def to_param(self) -> Dict:
-#         """Convert tool to function call format."""
-#         return {
-#             "type": "function",
-#             "function": {
-#                 "name": self.name,
-#                 "description": self.description,
-#                 "parameters": self.parameters,
-#             },
-#         }
 
 
 class ToolResult(BaseModel):
@@ -43,11 +15,10 @@ class ToolResult(BaseModel):
     base64_image: Optional[str] = Field(default=None)
     system: Optional[str] = Field(default=None)
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __bool__(self):
-        return any(getattr(self, field) for field in self.__fields__)
+        return any(getattr(self, field) for field in self.model_fields)
 
     def __add__(self, other: "ToolResult"):
         def combine_fields(
@@ -67,12 +38,11 @@ class ToolResult(BaseModel):
         )
 
     def __str__(self):
-        return f"Error: {self.error}" if self.error else self.output
+        return f"Error: {self.error}" if self.error else str(self.output)
 
     def replace(self, **kwargs):
         """Returns a new ToolResult with the given fields replaced."""
-        # return self.copy(update=kwargs)
-        return type(self)(**{**self.dict(), **kwargs})
+        return self.model_copy(update=kwargs)
 
 
 class BaseTool(ABC, BaseModel):
@@ -88,30 +58,13 @@ class BaseTool(ABC, BaseModel):
         name (str): Tool name
         description (str): Tool description
         parameters (dict): Tool parameters schema
-        _schemas (Dict[str, List[ToolSchema]]): Registered method schemas
     """
 
     name: str
     description: str
     parameters: Optional[dict] = None
-    # _schemas: Dict[str, List[ToolSchema]] = {}
 
-    class Config:
-        arbitrary_types_allowed = True
-        underscore_attrs_are_private = False
-
-    # def __init__(self, **data):
-    #     """Initialize tool with model validation and schema registration."""
-    #     super().__init__(**data)
-    #     logger.debug(f"Initializing tool class: {self.__class__.__name__}")
-    #     self._register_schemas()
-
-    # def _register_schemas(self):
-    #     """Register schemas from all decorated methods."""
-    #     for name, method in inspect.getmembers(self, predicate=inspect.ismethod):
-    #         if hasattr(method, 'tool_schemas'):
-    #             self._schemas[name] = method.tool_schemas
-    #             logger.debug(f"Registered schemas for method '{name}' in {self.__class__.__name__}")
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     async def __call__(self, **kwargs) -> Any:
         """Execute the tool with given parameters."""
@@ -135,14 +88,6 @@ class BaseTool(ABC, BaseModel):
                 "parameters": self.parameters,
             },
         }
-
-    # def get_schemas(self) -> Dict[str, List[ToolSchema]]:
-    #     """Get all registered tool schemas.
-
-    #     Returns:
-    #         Dict mapping method names to their schema definitions
-    #     """
-    #     return self._schemas
 
     def success_response(self, data: Union[Dict[str, Any], str]) -> ToolResult:
         """Create a successful tool result.
