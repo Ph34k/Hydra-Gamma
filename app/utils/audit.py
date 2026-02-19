@@ -23,6 +23,7 @@ class AuditLogger:
         self,
         event_type: str,
         task_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
         user_id: Optional[str] = None,
         tool_name: Optional[str] = None,
         tool_args: Optional[Dict[str, Any]] = None,
@@ -38,6 +39,7 @@ class AuditLogger:
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "event_type": event_type,
             "task_id": task_id or str(uuid.uuid4()), # Default if not provided
+            "trace_id": trace_id or str(uuid.uuid4()), # Unique trace ID for request/session
             "user_id": user_id,
             "tool_name": tool_name,
             "tool_args": tool_args,
@@ -57,11 +59,11 @@ class AuditLogger:
             # Fallback to stderr if file write fails
             print(f"FAILED TO WRITE AUDIT LOG: {e}")
 
-    def log_tool_call(self, task_id, user_id, tool_name, tool_args):
-        self.log_event("tool_call", task_id=task_id, user_id=user_id, tool_name=tool_name, tool_args=tool_args)
+    def log_tool_call(self, task_id, user_id, tool_name, tool_args, trace_id=None):
+        self.log_event("tool_call", task_id=task_id, trace_id=trace_id, user_id=user_id, tool_name=tool_name, tool_args=tool_args)
 
-    def log_tool_result(self, task_id, user_id, tool_name, status, duration_ms, result):
+    def log_tool_result(self, task_id, user_id, tool_name, status, duration_ms, result, trace_id=None):
         # Truncate result in payload if too large
         payload = str(result)[:1000] if result else None
-        self.log_event("tool_result", task_id=task_id, user_id=user_id, tool_name=tool_name,
+        self.log_event("tool_result", task_id=task_id, trace_id=trace_id, user_id=user_id, tool_name=tool_name,
                        result_status=status, duration_ms=duration_ms, payload=payload)

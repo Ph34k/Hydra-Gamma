@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Any
 from pydantic import BaseModel, Field
 
 class UserRole(str, Enum):
@@ -7,14 +7,32 @@ class UserRole(str, Enum):
     PRO = "pro"
     ENTERPRISE = "enterprise"
 
+class Action(str, Enum):
+    EXEC = "exec"
+    READ = "read"
+    WRITE = "write"
+    NAVIGATE = "navigate"
+    INIT = "init"
+    PORT = "port"
+    CALL = "call"
+    CRON = "cron"
+    ANY = "*"
+
+class Resource(str, Enum):
+    SHELL = "shell"
+    BASH = "bash"
+    FILE = "file_tool"
+    SEARCH = "search_tool"
+    BROWSER = "browser_tool"
+    WEBDEV = "web_dev_tool"
+    EXPOSE = "expose"
+    MCP = "mcp_tool"
+    SCHEDULE = "schedule_tool"
+
 class Permission(BaseModel):
     resource: str  # tool_name
     action: str    # exec, read, write
     # Optional: specific constraints like allowed_commands for shell
-
-class RoleConfig(BaseModel):
-    name: UserRole
-    permissions: List[Permission]
 
 class User(BaseModel):
     id: str
@@ -41,32 +59,32 @@ class RBACManager:
         # Note: We use "shell" as the resource name, but "bash" tool maps to it.
         return {
             UserRole.FREE: [
-                Permission(resource="shell", action="exec"),
-                Permission(resource="bash", action="exec"), # Alias
-                Permission(resource="file_tool", action="read"),
-                Permission(resource="search_tool", action="exec"), # Changed from info to exec to match ToolCallAgent default
+                Permission(resource=Resource.SHELL, action=Action.EXEC),
+                Permission(resource=Resource.BASH, action=Action.EXEC), # Alias
+                Permission(resource=Resource.FILE, action=Action.READ),
+                Permission(resource=Resource.SEARCH, action=Action.EXEC),
             ],
             UserRole.PRO: [
-                Permission(resource="shell", action="exec"),
-                Permission(resource="bash", action="exec"),
-                Permission(resource="file_tool", action="read"),
-                Permission(resource="file_tool", action="write"),
-                Permission(resource="browser_tool", action="navigate"),
-                Permission(resource="web_dev_tool", action="init"),
-                Permission(resource="expose", action="port"),
-                Permission(resource="search_tool", action="exec"),
+                Permission(resource=Resource.SHELL, action=Action.EXEC),
+                Permission(resource=Resource.BASH, action=Action.EXEC),
+                Permission(resource=Resource.FILE, action=Action.READ),
+                Permission(resource=Resource.FILE, action=Action.WRITE),
+                Permission(resource=Resource.BROWSER, action=Action.NAVIGATE),
+                Permission(resource=Resource.WEBDEV, action=Action.INIT),
+                Permission(resource=Resource.EXPOSE, action=Action.PORT),
+                Permission(resource=Resource.SEARCH, action=Action.EXEC),
             ],
             UserRole.ENTERPRISE: [
-                Permission(resource="shell", action="exec"),
-                Permission(resource="bash", action="exec"),
-                Permission(resource="file_tool", action="read"),
-                Permission(resource="file_tool", action="write"),
-                Permission(resource="browser_tool", action="navigate"),
-                Permission(resource="web_dev_tool", action="init"),
-                Permission(resource="expose", action="port"),
-                Permission(resource="search_tool", action="exec"),
-                Permission(resource="mcp_tool", action="call"),
-                Permission(resource="schedule_tool", action="cron"),
+                Permission(resource=Resource.SHELL, action=Action.EXEC),
+                Permission(resource=Resource.BASH, action=Action.EXEC),
+                Permission(resource=Resource.FILE, action=Action.READ),
+                Permission(resource=Resource.FILE, action=Action.WRITE),
+                Permission(resource=Resource.BROWSER, action=Action.NAVIGATE),
+                Permission(resource=Resource.WEBDEV, action=Action.INIT),
+                Permission(resource=Resource.EXPOSE, action=Action.PORT),
+                Permission(resource=Resource.SEARCH, action=Action.EXEC),
+                Permission(resource=Resource.MCP, action=Action.CALL),
+                Permission(resource=Resource.SCHEDULE, action=Action.CRON),
             ]
         }
 
@@ -78,7 +96,7 @@ class RBACManager:
 
         # Check if basic permission exists
         has_base_perm = any(
-            p.resource == resource and (p.action == action or p.action == "*")
+            p.resource == resource and (p.action == action or p.action == Action.ANY)
             for p in user_permissions
         )
 
@@ -86,10 +104,10 @@ class RBACManager:
             return False
 
         # Granular checks based on Role and Resource
-        if (resource == "shell" or resource == "bash") and action == "exec":
+        if (resource == Resource.SHELL or resource == Resource.BASH) and action == Action.EXEC:
             return self._check_shell_permission(user.role, tool_args)
 
-        if resource == "file_tool":
+        if resource == Resource.FILE:
              return self._check_file_permission(user.role, action, tool_args)
 
         return True
@@ -104,6 +122,8 @@ class RBACManager:
             return command in self.BASIC_SHELL_COMMANDS
 
         if role == UserRole.PRO:
+            # Pro users can run almost anything, but we might want to restrict dangerous ones
+            # (though EthicalGuard handles dangerous ones globally)
             return True
 
         if role == UserRole.ENTERPRISE:
@@ -113,9 +133,10 @@ class RBACManager:
 
     def _check_file_permission(self, role: UserRole, action: str, args: Optional[Dict]) -> bool:
         if role == UserRole.FREE:
-            if action == "write":
+            if action == Action.WRITE:
                 return False
-            if action == "read":
+            if action == Action.READ:
+                # Can enforce reading only specific directories if args provided
                 return True
 
         return True
