@@ -4,8 +4,9 @@ import tempfile
 import shutil
 from pathlib import Path
 from typing import List, Protocol, Tuple, Union, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.exceptions import ToolError
+from app.tool.base import BaseTool, ToolResult
 
 PathLike = Union[str, Path]
 
@@ -14,18 +15,80 @@ class EditOperation(BaseModel):
     replace: str
     all: bool = False
 
-class AtomicFileTool:
+class FileTool(BaseTool):
     """A tool for safe and atomic file operations."""
+    name: str = "file_tool"
+    description: str = "Read, write, append, and edit files atomically."
+    parameters: dict = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["read", "write", "append", "edit", "list"],
+                "description": "The file operation to perform.",
+            },
+            "path": {
+                "type": "string",
+                "description": "The file path relative to the workspace.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Content to write or append.",
+            },
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "find": {"type": "string"},
+                        "replace": {"type": "string"},
+                        "all": {"type": "boolean"},
+                    }
+                },
+                "description": "List of edit operations (find/replace).",
+            },
+        },
+        "required": ["action", "path"],
+    }
 
-    def __init__(self, base_dir: PathLike):
-        self.base_dir = Path(base_dir).resolve()
+    base_dir: Path = Field(default_factory=lambda: Path(os.getcwd()))
 
     def _validate_path(self, path: PathLike) -> Path:
         """Validate that the path is within the base directory."""
         full_path = (self.base_dir / path).resolve()
-        if not str(full_path).startswith(str(self.base_dir)):
-            raise ToolError(f"Access denied: {path} is outside the sandbox.")
+        if not str(full_path).startswith(str(self.base_dir.resolve())):
+             raise ToolError(f"Access denied: {path} is outside the sandbox.")
         return full_path
+
+    async def execute(self, action: str, path: str, content: Optional[str] = None, edits: Optional[List[dict]] = None, **kwargs) -> ToolResult:
+        try:
+            if action == "read":
+                text = await self.read(path)
+                return ToolResult(output=text)
+            elif action == "write":
+                if content is None:
+                    return ToolResult(error="Content required for write action")
+                await self.write(path, content)
+                return ToolResult(output=f"Successfully wrote to {path}")
+            elif action == "append":
+                if content is None:
+                    return ToolResult(error="Content required for append action")
+                await self.append(path, content)
+                return ToolResult(output=f"Successfully appended to {path}")
+            elif action == "edit":
+                if edits is None:
+                    return ToolResult(error="Edits required for edit action")
+                # Parse edits from dict to EditOperation
+                edit_ops = [EditOperation(**e) for e in edits]
+                await self.edit(path, edit_ops)
+                return ToolResult(output=f"Successfully edited {path}")
+            elif action == "list":
+                files = await self.list_files(path)
+                return ToolResult(output="\n".join(files))
+            else:
+                return ToolResult(error=f"Unknown action: {action}")
+        except Exception as e:
+            return ToolResult(error=str(e))
 
     async def read(self, path: PathLike) -> str:
         """Read content from a file."""
@@ -40,6 +103,9 @@ class AtomicFileTool:
     async def write(self, path: PathLike, content: str) -> None:
         """Write content to a file atomically."""
         full_path = self._validate_path(path)
+
+        # Ensure directory exists
+        full_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Atomic write implementation
         tmp_fd, tmp_path = tempfile.mkstemp(dir=self.base_dir, text=True)
@@ -60,13 +126,6 @@ class AtomicFileTool:
         """Append content to a file."""
         full_path = self._validate_path(path)
         try:
-            # We must read, append, and write atomically to be safe,
-            # or rely on OS append if we don't care about atomic replacement of the *whole* file.
-            # But "Atomic Write" implies replacement.
-            # For append, we can just open in append mode, but it's not atomic in the "replace" sense.
-            # Following the chapter 18.3.1, let's do the read-modify-write cycle for true atomicity if needed,
-            # but usually append is done directly.
-            # However, to support `fsync` and full replacement safety:
             original = ""
             if full_path.exists():
                  original = full_path.read_text(encoding="utf-8")
@@ -91,5 +150,7 @@ class AtomicFileTool:
         """List files in a directory."""
         full_path = self._validate_path(path)
         if not full_path.is_dir():
+             if full_path.is_file():
+                 return [full_path.name]
              raise ToolError(f"Not a directory: {path}")
         return [p.name for p in full_path.iterdir()]
