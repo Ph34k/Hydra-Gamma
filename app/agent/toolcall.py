@@ -1,9 +1,11 @@
 import asyncio
 import json
 import re
-from typing import Any, List, Optional, Union
+import time
+import os
+from typing import Any, List, Optional, Union, Dict
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from app.agent.react import ReActAgent
 from app.exceptions import TokenLimitExceeded
@@ -12,9 +14,23 @@ from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
 
+# Security Modules
+from app.agent.rbac import RBACManager, User, UserRole
+from app.agent.secrets import SecretsManager
+from app.agent.safety import EthicalGuard
+from app.utils.audit import AuditLogger
+from app.utils.sanitizer import Sanitizer
+
 
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
 
+# Chapter 34: Secrets Mapping
+TOOL_REQUIRED_SECRETS = {
+    "notion_tool": ["NOTION_API_KEY"],
+    "search_tool": ["SEARCH_API_KEY", "GOOGLE_API_KEY", "BING_API_KEY"],
+    "mcp_tool": ["MCP_API_KEY"],
+    # Add more mappings as needed
+}
 
 class ToolCallAgent(ReActAgent):
     """Base agent class for handling tool/function calls with enhanced abstraction"""
@@ -36,6 +52,23 @@ class ToolCallAgent(ReActAgent):
 
     max_steps: int = 30
     max_observe: Optional[Union[int, bool]] = None
+
+    # Security Components (Private Attributes)
+    _rbac: RBACManager = PrivateAttr()
+    _secrets: SecretsManager = PrivateAttr()
+    _audit: AuditLogger = PrivateAttr()
+    _user: User = PrivateAttr()
+    _secrets_lock: asyncio.Lock = PrivateAttr()
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Initialize Security Components
+        self._rbac = RBACManager()
+        self._secrets = SecretsManager()
+        self._audit = AuditLogger()
+        self._secrets_lock = asyncio.Lock()
+        # Default user context (In a real app, this would be passed in)
+        self._user = User(id="default_user", role=UserRole.ENTERPRISE)
 
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
@@ -155,22 +188,10 @@ class ToolCallAgent(ReActAgent):
             )
 
             # Add tool response to memory
-            # Note: We need to handle base64 images if they were returned.
-            # execute_tool returns a string, but stores base64 in self._current_base64_image
-            # Parallel execution complicates this as self._current_base64_image is shared state.
-            # We should refactor execute_tool to return the full result object or modify how image is stored.
-            # For strict Chapter 5 compliance (robustness), we assume execute_tool handles the specific return.
-            # But currently execute_tool returns a string observation.
-
-            # Since execute_tool is now running in parallel, updating self._current_base64_image is not thread-safe/async-safe context-wise.
-            # However, for now, we will stick to the existing tool message structure.
-            # Ideally execute_tool should return a structured object.
-
             tool_msg = Message.tool_message(
                 content=result,
                 tool_call_id=command.id,
                 name=command.function.name,
-                # base64_image=self._current_base64_image, # Temporarily disabled for parallel safety or need refactor
             )
             self.memory.add_message(tool_msg)
 
@@ -179,17 +200,14 @@ class ToolCallAgent(ReActAgent):
     def _sanitize_command(self, name: str, args: dict) -> bool:
         """Sanitize tool arguments (Security Layer)."""
         # Block dangerous shell commands
-        if "shell" in name.lower() or "bash" in name.lower() or "cmd" in name.lower():
-            command = args.get("command", "")
-            forbidden = ["rm -rf /", ":(){ :|:& };:", "mkfs", "dd if=/dev/zero"]
-            for bad in forbidden:
-                if bad in command:
-                    logger.warning(f"Blocked dangerous command: {command}")
-                    return False
+        # Using EthicalGuard now instead of hardcoded list here, but keeping basic check or delegating?
+        # I'll delegate to EthicalGuard in execute_tool.
         return True
 
     async def execute_tool(self, command: ToolCall) -> str:
-        """Execute a single tool call with robust error handling and sanitization"""
+        """Execute a single tool call with robust error handling and security checks"""
+        start_time = time.time()
+
         if not command or not command.function or not command.function.name:
             return "Error: Invalid command format"
 
@@ -199,51 +217,113 @@ class ToolCallAgent(ReActAgent):
 
         try:
             # Parse arguments
-            args = json.loads(command.function.arguments or "{}")
+            args_str = command.function.arguments or "{}"
+            args = json.loads(args_str)
 
-            # Sanitization Step
-            if not self._sanitize_command(name, args):
-                return f"Error: Command blocked by security policy."
+            # 1. Audit Log (Start)
+            self._audit.log_tool_call(
+                task_id=self.memory.messages[0].content[:20] if self.memory.messages else "unknown", # weak task id
+                user_id=self._user.id,
+                tool_name=name,
+                tool_args=Sanitizer.sanitize(args) # Sanitize PII in logs
+            )
 
-            # Execute the tool
+            # 2. Ethical Guard (Input)
+            is_safe, error_msg = EthicalGuard.check_tool_args(name, args)
+            if not is_safe:
+                self._audit.log_event("security_blocked", tool_name=name, payload=error_msg)
+                return f"Error: {error_msg}"
+
+            # 3. RBAC Check
+            # Assuming 'exec' action for all tools for now, or derive from name
+            action = "exec"
+            if "read" in name: action = "read"
+            if "write" in name: action = "write"
+
+            if not self._rbac.check_permission(self._user, name, action, args):
+                error_msg = f"Permission denied for user role {self._user.role} on {name}"
+                self._audit.log_event("rbac_denied", tool_name=name, payload=error_msg)
+                return f"Error: {error_msg}"
+
+            # 4. Secrets Injection
+            required_keys = TOOL_REQUIRED_SECRETS.get(name, [])
+            secrets_to_inject = {}
+            for key in required_keys:
+                secret = self._secrets.get_secret(key)
+                if secret:
+                    secrets_to_inject[key] = secret
+
+            # Special case for Shell/Bash tools: Prepend export
+            if (name == "shell" or name == "bash") and "command" in args:
+                # We can inject specific secrets if command mentions them, or just generic ones if we had a mapping.
+                # Since 'shell' is generic, we don't know which keys it needs.
+                # But if we did (e.g. from user instruction or args), we would prepend.
+                # For now, we only prepend if 'env_vars' is in args (if supported) or rely on generic injection below.
+                pass
+
             logger.info(f"🔧 Activating tool: '{name}'...")
 
-            # File Offloading Check (Section 5.5) happens inside specific tools or here if result is huge.
-            # We execute first.
-            result = await self.available_tools.execute(name=name, tool_input=args)
+            # 5. Execution (with Context Manager for Secrets)
+            if secrets_to_inject:
+                # Use lock to prevent race condition on os.environ
+                async with self._secrets_lock:
+                    original_env = os.environ.copy()
+                    os.environ.update(secrets_to_inject)
+                    try:
+                        result = await self.available_tools.execute(name=name, tool_input=args)
+                    finally:
+                        os.environ.clear()
+                        os.environ.update(original_env)
+            else:
+                # No secrets needed, run normally (parallel safe)
+                result = await self.available_tools.execute(name=name, tool_input=args)
 
             # Handle special tools
             await self._handle_special_tool(name=name, result=result)
 
-            # Check if result is a ToolResult with base64_image
-            # Note: In parallel execution, setting self._current_base64_image here is race-condition prone.
-            # Ideally we return a complex object. For now we just return the text representation.
-            if hasattr(result, "base64_image") and result.base64_image:
-                # self._current_base64_image = result.base64_image
-                pass
-
-            # Format result for display (standard case)
+            # Format result
             observation = str(result) if result else f"Cmd `{name}` completed with no output"
 
-            # Output Handling (Truncation/Offloading) - Section 5.5
+            # 6. Ethical Guard (Output) - e.g. check for PII leaks in output?
+            # Sanitizer handles PII masking. EthicalGuard could block massive leaks if implemented.
+
+            # 7. Sanitize Output
+            observation = Sanitizer.sanitize(observation)
+
+            # 8. Output Truncation
             if len(observation) > 5000:
-                # Truncate
                 observation = observation[:5000] + "\n... [Output Truncated]"
-                # In a real implementation, we would save to file here:
-                # filename = f"output_{command.id}.txt"
-                # with open(filename, "w") as f: f.write(str(result))
-                # observation = f"Output too large. Saved to {filename}"
+
+            # 9. Audit Log (End)
+            duration = (time.time() - start_time) * 1000
+            self._audit.log_tool_result(
+                task_id="unknown",
+                user_id=self._user.id,
+                tool_name=name,
+                status="success",
+                duration_ms=duration,
+                result=observation
+            )
 
             return observation
+
         except json.JSONDecodeError:
             error_msg = f"Error parsing arguments for {name}: Invalid JSON format"
-            logger.error(
-                f"📝 Oops! The arguments for '{name}' don't make sense - invalid JSON, arguments:{command.function.arguments}"
-            )
+            logger.error(f"📝 Invalid JSON args: {command.function.arguments}")
             return f"Error: {error_msg}"
         except Exception as e:
+            duration = (time.time() - start_time) * 1000
             error_msg = f"⚠️ Tool '{name}' encountered a problem: {str(e)}"
             logger.exception(error_msg)
+
+            self._audit.log_tool_result(
+                task_id="unknown",
+                user_id=self._user.id,
+                tool_name=name,
+                status="error",
+                duration_ms=duration,
+                result=str(e)
+            )
             return f"Error: {error_msg}"
 
     async def _handle_special_tool(self, name: str, result: Any, **kwargs):
