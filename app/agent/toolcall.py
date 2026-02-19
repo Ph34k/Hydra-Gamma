@@ -15,9 +15,9 @@ from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoi
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
 
 # Security Modules
-from app.agent.rbac import RBACManager, User, UserRole
+from app.agent.rbac import RBACManager, User, UserRole, Action
 from app.agent.secrets import SecretsManager
-from app.agent.safety import EthicalGuard
+from app.agent.safety import EthicalGuard, PromptGuard, ComplianceManager, HallucinationMonitor
 from app.utils.audit import AuditLogger
 from app.utils.sanitizer import Sanitizer
 
@@ -57,6 +57,7 @@ class ToolCallAgent(ReActAgent):
     _rbac: RBACManager = PrivateAttr()
     _secrets: SecretsManager = PrivateAttr()
     _audit: AuditLogger = PrivateAttr()
+    _compliance: ComplianceManager = PrivateAttr()
     _user: User = PrivateAttr()
     _secrets_lock: asyncio.Lock = PrivateAttr()
 
@@ -66,6 +67,7 @@ class ToolCallAgent(ReActAgent):
         self._rbac = RBACManager()
         self._secrets = SecretsManager()
         self._audit = AuditLogger()
+        self._compliance = ComplianceManager()
         self._secrets_lock = asyncio.Lock()
         # Default user context (In a real app, this would be passed in)
         self._user = User(id="default_user", role=UserRole.ENTERPRISE)
@@ -110,6 +112,24 @@ class ToolCallAgent(ReActAgent):
             response.tool_calls if response and response.tool_calls else []
         )
         content = response.content if response and response.content else ""
+
+        # Ethical Guard (Thought)
+        if content:
+            is_safe, error_msg = EthicalGuard.check_thought(content)
+            if not is_safe:
+                logger.warning(f"🚫 Thought blocked by EthicalGuard: {error_msg}")
+                content = f"⚠️ My previous thought was blocked due to safety policy: {error_msg}. I must re-evaluate."
+                self.memory.add_message(Message.assistant_message(content))
+                return False
+
+            # Hallucination Monitor (Confidence Check)
+            confidence = HallucinationMonitor.check_confidence(content)
+            if confidence < 0.7:
+                logger.warning(f"🤔 Low confidence thought detected ({confidence:.2f}): {content}")
+                # Ideally, we should trigger a search or verification step here
+                # For now, we log it and proceed, but add a self-correction prompt to memory
+                # content += f"\n(Self-Correction: I am not fully confident in this. I should verify facts before acting.)"
+                # For simplicity in this iteration, we just log.
 
         # Log response info
         logger.info(f"✨ {self.name}'s thoughts: {content}")
@@ -235,48 +255,47 @@ class ToolCallAgent(ReActAgent):
                 return f"Error: {error_msg}"
 
             # 3. RBAC Check
-            # Assuming 'exec' action for all tools for now, or derive from name
-            action = "exec"
-            if "read" in name: action = "read"
-            if "write" in name: action = "write"
+            action = Action.EXEC
+            if "read" in name: action = Action.READ
+            if "write" in name: action = Action.WRITE
+            if "navigate" in name: action = Action.NAVIGATE
 
-            if not self._rbac.check_permission(self._user, name, action, args):
+            # Refine action based on args if available (for tools like file_tool)
+            if "action" in args:
+                val = args["action"].lower()
+                if "read" in val: action = Action.READ
+                elif "write" in val or "append" in val or "edit" in val: action = Action.WRITE
+                elif "navigate" in val or "goto" in val: action = Action.NAVIGATE
+                elif "init" in val: action = Action.INIT
+                elif "cron" in val: action = Action.CRON
+
+            # Allow fallback to string if Action enum fails or just pass string
+            action_str = str(action.value) if isinstance(action, Action) else action
+
+            if not self._rbac.check_permission(self._user, name, action_str, args):
                 error_msg = f"Permission denied for user role {self._user.role} on {name}"
                 self._audit.log_event("rbac_denied", tool_name=name, payload=error_msg)
                 return f"Error: {error_msg}"
 
+            # Compliance Logging (Chapter 40)
+            if name in ["file_tool", "search_tool", "mcp_tool"]:
+                 self._compliance.register_data_access(
+                     user_id=self._user.id,
+                     data_id=f"{name}:{action_str}",
+                     purpose=f"Tool execution: {name} {action_str}"
+                 )
+
             # 4. Secrets Injection
             required_keys = TOOL_REQUIRED_SECRETS.get(name, [])
-            secrets_to_inject = {}
-            for key in required_keys:
-                secret = self._secrets.get_secret(key)
-                if secret:
-                    secrets_to_inject[key] = secret
-
-            # Special case for Shell/Bash tools: Prepend export
-            if (name == "shell" or name == "bash") and "command" in args:
-                # We can inject specific secrets if command mentions them, or just generic ones if we had a mapping.
-                # Since 'shell' is generic, we don't know which keys it needs.
-                # But if we did (e.g. from user instruction or args), we would prepend.
-                # For now, we only prepend if 'env_vars' is in args (if supported) or rely on generic injection below.
-                pass
 
             logger.info(f"🔧 Activating tool: '{name}'...")
 
             # 5. Execution (with Context Manager for Secrets)
-            if secrets_to_inject:
-                # Use lock to prevent race condition on os.environ
-                async with self._secrets_lock:
-                    original_env = os.environ.copy()
-                    os.environ.update(secrets_to_inject)
-                    try:
-                        result = await self.available_tools.execute(name=name, tool_input=args)
-                    finally:
-                        os.environ.clear()
-                        os.environ.update(original_env)
-            else:
-                # No secrets needed, run normally (parallel safe)
-                result = await self.available_tools.execute(name=name, tool_input=args)
+            # Use inject_env_vars context manager which handles cleanup
+            # Wrap with lock to prevent race conditions on os.environ in threaded/async env
+            async with self._secrets_lock:
+                with self._secrets.inject_env_vars(required_keys):
+                    result = await self.available_tools.execute(name=name, tool_input=args)
 
             # Handle special tools
             await self._handle_special_tool(name=name, result=result)
@@ -363,6 +382,12 @@ class ToolCallAgent(ReActAgent):
 
     async def run(self, request: Optional[str] = None) -> str:
         """Run the agent with cleanup when done."""
+        # Prompt Guard (Input)
+        if request:
+            is_safe, error_msg = PromptGuard.check_input(request)
+            if not is_safe:
+                return f"Error: {error_msg}"
+
         try:
             return await super().run(request)
         finally:
