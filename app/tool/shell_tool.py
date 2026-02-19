@@ -1,72 +1,75 @@
 import asyncio
 import os
-import signal
 import uuid
-import subprocess
 from typing import Dict, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
 from app.exceptions import ToolError
+from app.tool.base import BaseTool, ToolResult
 
 class ShellSession(BaseModel):
     id: str
     current_dir: str
-    history: List[str] = []
-    # We can't store the process object directly in Pydantic, so we manage it separately
+    history: List[str] = Field(default_factory=list)
     pid: Optional[int] = None
 
-class ShellResult(BaseModel):
-    stdout: str
-    stderr: str
-    exit_code: int
-
-class ShellTool:
+class ShellTool(BaseTool):
     """A tool for executing bash commands with persistent sessions."""
+    name: str = "shell"
+    description: str = "Execute bash commands in a persistent shell session. Use this for running tests, managing files, and git operations."
+    parameters: dict = {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "The bash command to execute.",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Session ID to maintain state (optional).",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds (default 60).",
+            },
+        },
+        "required": ["command"],
+    }
+
+    sessions: Dict[str, ShellSession] = Field(default_factory=dict, exclude=True)
+    _processes: Dict[str, asyncio.subprocess.Process] = {}
 
     blacklist: List[str] = ["sudo", "reboot", "shutdown", "mount", "rm -rf /"]
-    whitelist: List[str] = ["ls", "cd", "mkdir", "pip", "git", "python", "echo", "cat", "grep", "find", "pwd", "cp", "mv"]
 
-    def __init__(self):
-        self.sessions: Dict[str, ShellSession] = {}
-        self._processes: Dict[str, asyncio.subprocess.Process] = {}
+    async def execute(self, command: str, session_id: Optional[str] = None, timeout: int = 60, **kwargs) -> ToolResult:
+        if not session_id:
+            session_id = await self.create_session()
 
-    def _validate_command(self, command: str) -> None:
-        """Validate command against blacklist/whitelist."""
-        # Simple check for now
-        cmd_base = command.split()[0] if command else ""
-        if cmd_base in self.blacklist:
-            raise ToolError(f"Command '{cmd_base}' is blacklisted.")
-
-        # Whitelist check is often too restrictive for a general shell,
-        # but requested in Chapter 19.4. Let's enforce it strictly if needed,
-        # or treat it as a 'safe list' recommendation.
-        # For now, I'll enforce blacklist primarily.
-
-    async def create_session(self) -> str:
-        """Create a new shell session."""
-        session_id = str(uuid.uuid4())
-        self.sessions[session_id] = ShellSession(id=session_id, current_dir=os.getcwd())
-        return session_id
-
-    async def exec(self, session_id: str, command: str, timeout: int = 60) -> ShellResult:
-        """Execute a command in a specific session."""
         if session_id not in self.sessions:
-            raise ToolError(f"Session {session_id} not found.")
+             # Auto-create if not found (or return error?)
+             # For smoother UX, let's create a new one if not found, but warn?
+             # Better to just create one if missing for now.
+             self.sessions[session_id] = ShellSession(id=session_id, current_dir=os.getcwd())
 
-        self._validate_command(command)
         session = self.sessions[session_id]
 
-        # Update history
+        # Blacklist check
+        cmd_base = command.split()[0] if command else ""
+        if cmd_base in self.blacklist:
+            return ToolResult(error=f"Command '{cmd_base}' is blacklisted.")
+
         session.history.append(command)
 
-        # Handle 'cd' specially as it changes session state
+        # Handle 'cd' specially
         if command.startswith("cd "):
             path = command.split(" ", 1)[1].strip()
+            # Handle relative paths correctly
             new_dir = os.path.abspath(os.path.join(session.current_dir, path))
             if os.path.exists(new_dir) and os.path.isdir(new_dir):
                 session.current_dir = new_dir
-                return ShellResult(stdout="", stderr="", exit_code=0)
+                return ToolResult(output=f"Changed directory to {new_dir}", system=f"Session ID: {session_id}")
             else:
-                return ShellResult(stdout="", stderr=f"Directory not found: {path}", exit_code=1)
+                return ToolResult(error=f"Directory not found: {path}")
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -74,36 +77,38 @@ class ShellTool:
                 cwd=session.current_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                preexec_fn=os.setsid  # To allow killing process group
+                preexec_fn=os.setsid
             )
 
-            # Store process for potential killing/interaction
-            self._processes[session_id] = process
-            session.pid = process.pid
+            # Store process? complex with async execution model of ToolCallAgent...
+            # For now, just wait for result.
 
             try:
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-                return ShellResult(
-                    stdout=stdout.decode().strip(),
-                    stderr=stderr.decode().strip(),
-                    exit_code=process.returncode
-                )
+                output = stdout.decode().strip()
+                error = stderr.decode().strip()
+
+                # Combine output
+                full_output = output
+                if error:
+                     full_output += f"\nSTDERR:\n{error}"
+
+                if process.returncode != 0:
+                     return ToolResult(error=f"Command failed with code {process.returncode}:\n{full_output}", system=f"Session ID: {session_id}")
+
+                return ToolResult(output=full_output if full_output else "Success (No Output)", system=f"Session ID: {session_id}")
+
             except asyncio.TimeoutError:
-                process.kill()
-                raise ToolError(f"Command timed out after {timeout} seconds.")
-            finally:
-                if session_id in self._processes:
-                    del self._processes[session_id]
-                session.pid = None
+                try:
+                    process.kill()
+                except:
+                    pass
+                return ToolResult(error=f"Command timed out after {timeout} seconds.")
 
         except Exception as e:
-             raise ToolError(f"Execution failed: {str(e)}")
+            return ToolResult(error=f"Execution exception: {str(e)}")
 
-    async def kill(self, session_id: str) -> None:
-        """Kill the process running in the session."""
-        if session_id in self._processes:
-            try:
-                self._processes[session_id].kill()
-            except ProcessLookupError:
-                pass
-            del self._processes[session_id]
+    async def create_session(self) -> str:
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = ShellSession(id=session_id, current_dir=os.getcwd())
+        return session_id

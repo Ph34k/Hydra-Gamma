@@ -35,7 +35,7 @@ from app.tool.memory import MemorySearchTool
 from app.agent.router import Router, TaskPhase
 from app.agent.budget import BudgetManager
 from app.tool.shell_tool import ShellTool
-from app.tool.file_tool import AtomicFileTool
+from app.tool.file_tool import FileTool
 
 
 class Manus(ToolCallAgent):

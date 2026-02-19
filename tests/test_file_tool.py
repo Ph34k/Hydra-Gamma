@@ -3,12 +3,12 @@ import asyncio
 import os
 import tempfile
 from pathlib import Path
-from app.tool.file_tool import AtomicFileTool
+from app.tool.file_tool import FileTool
 
-class TestAtomicFileTool(unittest.TestCase):
+class TestFileTool(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.TemporaryDirectory()
-        self.tool = AtomicFileTool(self.test_dir.name)
+        self.tool = FileTool(base_dir=Path(self.test_dir.name))
 
     def tearDown(self):
         self.test_dir.cleanup()
@@ -31,6 +31,15 @@ class TestAtomicFileTool(unittest.TestCase):
             await self.tool.write("test.txt", "Updated")
             content = await self.tool.read("test.txt")
             self.assertEqual(content, "Updated")
+
+    def test_execute_interface(self):
+        async def run():
+            # Test the BaseTool execute interface
+            res = await self.tool.execute(action="write", path="exec.txt", content="Executed")
+            self.assertIsNone(res.error)
+
+            res = await self.tool.execute(action="read", path="exec.txt")
+            self.assertEqual(res.output, "Executed")
 
         asyncio.run(run())
 

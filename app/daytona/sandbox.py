@@ -1,4 +1,5 @@
 import time
+from typing import Optional
 
 from daytona import (
     CreateSandboxFromImageParams,
@@ -9,6 +10,7 @@ from daytona import (
     SandboxState,
     SessionExecuteRequest,
 )
+from daytona.common.errors import DaytonaError
 
 from app.config import config
 from app.utils.logger import logger
@@ -16,35 +18,55 @@ from app.utils.logger import logger
 
 # load_dotenv()
 daytona_settings = config.daytona
-logger.info("Initializing Daytona sandbox configuration")
-daytona_config = DaytonaConfig(
-    api_key=daytona_settings.daytona_api_key,
-    server_url=daytona_settings.daytona_server_url,
-    target=daytona_settings.daytona_target,
-)
 
-if daytona_config.api_key:
-    logger.info("Daytona API key configured successfully")
-else:
-    logger.warning("No Daytona API key found in environment variables")
+_daytona_client: Optional[Daytona] = None
 
-if daytona_config.server_url:
-    logger.info(f"Daytona server URL set to: {daytona_config.server_url}")
-else:
-    logger.warning("No Daytona server URL found in environment variables")
+def get_daytona_client() -> Daytona:
+    global _daytona_client
+    if _daytona_client:
+        return _daytona_client
 
-if daytona_config.target:
-    logger.info(f"Daytona target set to: {daytona_config.target}")
-else:
-    logger.warning("No Daytona target found in environment variables")
+    logger.info("Initializing Daytona sandbox configuration")
+    daytona_config = DaytonaConfig(
+        api_key=daytona_settings.daytona_api_key,
+        server_url=daytona_settings.daytona_server_url,
+        target=daytona_settings.daytona_target,
+    )
 
-daytona = Daytona(daytona_config)
-logger.info("Daytona client initialized")
+    if daytona_config.api_key:
+        logger.info("Daytona API key configured successfully")
+    else:
+        logger.warning("No Daytona API key found in environment variables")
+        # Allow running without API key for tests (mocking) or until actually used
+        # But Daytona constructor might raise error if key is missing.
+        if not daytona_config.api_key:
+             # If strictly required by Daytona SDK, we might need to mock or raise only when used.
+             # However, let's try to init. If it fails, we handle it.
+             pass
+
+    if daytona_config.server_url:
+        logger.info(f"Daytona server URL set to: {daytona_config.server_url}")
+
+    if daytona_config.target:
+        logger.info(f"Daytona target set to: {daytona_config.target}")
+
+    try:
+        _daytona_client = Daytona(daytona_config)
+        logger.info("Daytona client initialized")
+    except DaytonaError as e:
+        logger.error(f"Failed to initialize Daytona client: {e}")
+        # If in test mode, we might want to suppress this or provide a dummy?
+        # For now, let it raise if actual usage, but maybe not at module load time?
+        # But this function is called only when needed?
+        # No, if I call it lazily, it's fine.
+        raise e
+
+    return _daytona_client
 
 
 async def get_or_start_sandbox(sandbox_id: str):
     """Retrieve a sandbox by ID, check its state, and start it if needed."""
-
+    daytona = get_daytona_client()
     logger.info(f"Getting or starting sandbox with ID: {sandbox_id}")
 
     try:
@@ -101,7 +123,7 @@ def start_supervisord_session(sandbox: Sandbox):
 
 def create_sandbox(password: str, project_id: str = None):
     """Create a new sandbox with all required services configured and running."""
-
+    daytona = get_daytona_client()
     logger.info("Creating new Daytona sandbox environment")
     logger.info("Configuring sandbox with browser-use image and environment variables")
 
@@ -149,6 +171,7 @@ def create_sandbox(password: str, project_id: str = None):
 
 async def delete_sandbox(sandbox_id: str):
     """Delete a sandbox by its ID."""
+    daytona = get_daytona_client()
     logger.info(f"Deleting sandbox with ID: {sandbox_id}")
 
     try:

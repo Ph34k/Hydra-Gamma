@@ -18,6 +18,7 @@ from app.tool import CreateChatCompletion, Terminate, ToolCollection
 from app.agent.rbac import RBACManager, User, UserRole, Action
 from app.agent.secrets import SecretsManager
 from app.agent.safety import EthicalGuard, PromptGuard, ComplianceManager, HallucinationMonitor
+from app.agent.immunity import DigitalImmunitySystem
 from app.utils.audit import AuditLogger
 from app.utils.sanitizer import Sanitizer
 
@@ -58,6 +59,7 @@ class ToolCallAgent(ReActAgent):
     _secrets: SecretsManager = PrivateAttr()
     _audit: AuditLogger = PrivateAttr()
     _compliance: ComplianceManager = PrivateAttr()
+    _immunity: DigitalImmunitySystem = PrivateAttr()
     _user: User = PrivateAttr()
     _secrets_lock: asyncio.Lock = PrivateAttr()
 
@@ -68,6 +70,7 @@ class ToolCallAgent(ReActAgent):
         self._secrets = SecretsManager()
         self._audit = AuditLogger()
         self._compliance = ComplianceManager()
+        self._immunity = DigitalImmunitySystem()
         self._secrets_lock = asyncio.Lock()
         # Default user context (In a real app, this would be passed in)
         self._user = User(id="default_user", role=UserRole.ENTERPRISE)
@@ -254,6 +257,12 @@ class ToolCallAgent(ReActAgent):
                 self._audit.log_event("security_blocked", tool_name=name, payload=error_msg)
                 return f"Error: {error_msg}"
 
+            # 2.5. Digital Immunity (Behavioral Check)
+            if not self._immunity.monitor_tool_call(name, args):
+                error_msg = f"Digital Immunity blocked tool '{name}' due to suspicious behavior."
+                self._audit.log_event("immunity_blocked", tool_name=name, payload=error_msg)
+                return f"Error: {error_msg}"
+
             # 3. RBAC Check
             action = Action.EXEC
             if "read" in name: action = Action.READ
@@ -324,6 +333,9 @@ class ToolCallAgent(ReActAgent):
                 result=observation
             )
 
+            # Immunity: Record Success
+            self._immunity.record_success(name)
+
             return observation
 
         except json.JSONDecodeError:
@@ -343,6 +355,10 @@ class ToolCallAgent(ReActAgent):
                 duration_ms=duration,
                 result=str(e)
             )
+
+            # Immunity: Record Failure
+            self._immunity.record_failure(name)
+
             return f"Error: {error_msg}"
 
     async def _handle_special_tool(self, name: str, result: Any, **kwargs):
