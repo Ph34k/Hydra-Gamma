@@ -1,7 +1,7 @@
 import asyncio
-import argparse
 import datetime
 import os
+import time
 import json
 from typing import Dict, List, Optional, Any
 from pydantic import Field, model_validator
@@ -23,6 +23,14 @@ from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
 from app.agent.bdi import BeliefSet, GoalSet, IntentionPool, Plan, Phase
 
+# New Memory Components
+from app.memory.working import WorkingMemory
+from app.memory.semantic import SemanticMemory
+from app.memory.episodic import EpisodicStore, Episode, Action
+from app.memory.state import StateMonitor, AtomicState
+from app.metrics.performance import PerformanceMonitor
+from app.tool.memory import MemorySearchTool
+
 
 class Manus(ToolCallAgent):
     """A BDI-based agent with support for both local and MCP tools."""
@@ -40,6 +48,15 @@ class Manus(ToolCallAgent):
     beliefs: BeliefSet = Field(default_factory=BeliefSet)
     goals: GoalSet = Field(default_factory=GoalSet)
     intentions: IntentionPool = Field(default_factory=IntentionPool)
+
+    # Advanced Memory Components
+    working_memory: WorkingMemory = Field(default_factory=WorkingMemory)
+
+    # We use Optional for these as they might be heavy or need explicit init
+    semantic_memory: Optional[SemanticMemory] = None
+    episodic_store: Optional[EpisodicStore] = None
+    state_monitor: Optional[StateMonitor] = None
+    performance_monitor: Optional[PerformanceMonitor] = None
 
     # Reasoning & Memory
     reasoning_engine: Optional[ReasoningEngine] = None
@@ -59,6 +76,7 @@ class Manus(ToolCallAgent):
             StrReplaceEditor(),
             AskHuman(),
             Terminate(),
+            MemorySearchTool(), # Add Memory Search Tool
         )
     )
 
@@ -71,6 +89,9 @@ class Manus(ToolCallAgent):
     )  # server_id -> url/command
     _initialized: bool = False
 
+    # Current Episode Tracking
+    current_episode_actions: List[Action] = Field(default_factory=list)
+
     @model_validator(mode="after")
     def initialize_helper(self) -> "Manus":
         """Initialize basic components synchronously."""
@@ -78,6 +99,26 @@ class Manus(ToolCallAgent):
         if hasattr(self, 'llm') and self.llm:
              self.reasoning_engine = ReasoningEngine(self.llm)
              self.context_manager = ContextManager(self.llm)
+
+        # Initialize Monitors
+        self.state_monitor = StateMonitor()
+        self.performance_monitor = PerformanceMonitor()
+
+        # Initialize Memories (Lazy load handled inside classes, but we init wrappers here)
+        # Note: These init DB connections, so we might want to do it in create/async if possible,
+        # but the constructors are sync currently.
+        try:
+            self.semantic_memory = SemanticMemory()
+            self.episodic_store = EpisodicStore()
+
+            # Inject Semantic Memory into MemorySearchTool to avoid double loading
+            if self.available_tools:
+                mem_tool = self.available_tools.tool_map.get("memory_search")
+                if mem_tool and isinstance(mem_tool, MemorySearchTool):
+                    mem_tool.set_memory(self.semantic_memory)
+        except Exception as e:
+            logger.warning(f"Memory components failed to initialize (likely due to missing deps or environment): {e}")
+
         return self
 
     @classmethod
@@ -86,11 +127,13 @@ class Manus(ToolCallAgent):
         instance = cls(**kwargs)
         await instance.initialize_mcp_servers()
         instance._initialized = True
-        if instance.llm:
-             if not instance.reasoning_engine:
-                instance.reasoning_engine = ReasoningEngine(instance.llm)
-             if not instance.context_manager:
-                instance.context_manager = ContextManager(instance.llm)
+
+        # Re-ensure components if missed (redundant safety)
+        if not instance.performance_monitor:
+            instance.performance_monitor = PerformanceMonitor()
+        if not instance.state_monitor:
+            instance.state_monitor = StateMonitor()
+
         return instance
 
     async def initialize_mcp_servers(self) -> None:
@@ -166,14 +209,21 @@ class Manus(ToolCallAgent):
             await self.disconnect_mcp_server()
             self._initialized = False
 
+        # Log performance metrics
+        if self.performance_monitor:
+            self.performance_monitor.log_metrics()
+
     def _get_environment_snapshot(self) -> Dict[str, Any]:
         """Capture the current state of the environment."""
+        # Use StateMonitor if available
+        if self.state_monitor:
+            return self.state_monitor.get_snapshot()
+
+        # Fallback
         snapshot = {}
         try:
             snapshot["pwd"] = os.getcwd()
-            # Limit to 20 files for context to avoid huge prompts
             snapshot["ls"] = os.listdir(os.getcwd())[:20]
-            # Only capture relevant environment variables
             snapshot["env"] = {k: v for k, v in os.environ.items() if k in ["USER", "HOME", "PATH", "LANG"]}
         except Exception as e:
             logger.error(f"Failed to get environment snapshot: {e}")
@@ -190,6 +240,8 @@ class Manus(ToolCallAgent):
 
     async def think(self) -> bool:
         """Process current state and decide next actions using BDI reasoning loop and Reasoning Engine."""
+        start_time = time.time()
+
         if not self._initialized:
             await self.initialize_mcp_servers()
             self._initialized = True
@@ -205,8 +257,20 @@ class Manus(ToolCallAgent):
             await self.context_manager.manage_context(self.memory)
 
         # 1. Perception: Update beliefs from environment
-        snapshot = self._get_environment_snapshot()
-        self.beliefs.sync_with_environment(snapshot)
+        # Chapter 11: Heartbeat / State Synchronization
+        if self.state_monitor and self.state_monitor.check_heartbeat():
+             snapshot = self.state_monitor.get_snapshot()
+             self.beliefs.sync_with_environment(snapshot)
+             # Sync Working Memory State
+             for k, v in snapshot.items():
+                 self.working_memory.update_state(k, v)
+        else:
+             # Force update if no monitor or first run
+             snapshot = self._get_environment_snapshot()
+             self.beliefs.sync_with_environment(snapshot)
+             for k, v in snapshot.items():
+                 self.working_memory.update_state(k, v)
+
 
         # 2. Deliberation: Decide on goals (Desires)
         if not self.goals.active_goals and self.memory.messages:
@@ -215,19 +279,36 @@ class Manus(ToolCallAgent):
                  self.goals.add_goal(last_user_msg.content)
                  self.goals.get_active_goal() # Activate it
 
+        # Sync Active Goal to Working Memory
+        active_goal = self.goals.get_active_goal()
+        if active_goal:
+            self.working_memory.set_subgoal(active_goal.description)
+
+            # Chapter 10: Few-Shot Dynamic Injection (Episodic Memory)
+            # Check if we should inject similar episodes
+            if self.episodic_store and not self.working_memory.scratchpad: # Only if not already populated
+                examples = self.episodic_store.get_formatted_examples(active_goal.description)
+                if examples:
+                    self.working_memory.scratchpad += f"\n\n[Memory Injection]\n{examples}"
+
         # 3. Planning: Generate or Refine Plan (Intentions)
         current_plan_json = self.intentions.current_plan.model_dump_json() if self.intentions.current_plan else "No plan yet."
         active_goals_desc = [g.description for g in self.goals.active_goals]
 
+        # Update Working Memory History (syncing with agent memory)
+        # Note: In a full refactor, we would use working_memory.recent_history directly.
+        # Here we just ensure working_memory has access if needed, but we rely on 'messages' for LLM call.
+        self.working_memory.recent_history = self.memory.messages[-10:] # Keep last 10 in working memory view
+
+        # Construct Context using Working Memory (Chapter 8)
+        # We replace the raw BDI context with the sophisticated Working Memory Context
+        working_memory_context = self.working_memory.get_active_context()
+
         bdi_context = f"""
-Current Beliefs:
-{self.beliefs.get_summary()}
+{working_memory_context}
 
 Current Plan:
 {current_plan_json}
-
-Current Goals:
-{active_goals_desc}
 """
         # Apply Reasoning Strategy
         reasoning_strategy_output = ""
@@ -256,27 +337,87 @@ Current Goals:
             # Delegate to ToolCallAgent.think to interact with LLM and select tools
             # Use retry logic for resilience
             result = await self.think_with_retry()
+
+            # Metric Recording
+            if self.performance_monitor:
+                self.performance_monitor.record_step_duration(time.time() - start_time)
+                # Note: Token usage recording would require hooking into LLM response more deeply
+
+            return result
         finally:
              self.next_step_prompt = original_prompt
-
-        return result
 
     async def act(self) -> str:
         """Execute actions and update beliefs."""
         # 4. Execution
-        result = await super().act()
+        start_time = time.time()
+
+        # We need to capture which tool was called for metrics
+        # The tool_calls are in self.tool_calls
+        current_calls = self.tool_calls
+
+        try:
+            result = await super().act()
+            success = True
+            error_msg = None
+        except Exception as e:
+            result = f"Error: {str(e)}"
+            success = False
+            error_msg = str(e)
+            raise e # Re-raise after logging? super().act() catches exceptions in execute_tool usually
+
+        duration = time.time() - start_time
+
+        # Metrics & Episode Tracking
+        if current_calls:
+            for call in current_calls:
+                # Update Performance Metrics
+                if self.performance_monitor:
+                    self.performance_monitor.record_tool_call(
+                        tool_name=call.function.name,
+                        success=success, # Simplified, assumes all succeeded if no exception raised above
+                        duration=duration,
+                        error=error_msg
+                    )
+
+                # Update Episode Tracking
+                # We interpret result as the result for all calls (simplified)
+                # Ideally we map result to specific tool
+                action = Action(
+                    tool_name=call.function.name,
+                    arguments=json.loads(call.function.arguments or "{}"),
+                    result_summary=str(result)[:200]
+                )
+                self.current_episode_actions.append(action)
 
         # 5. Observation (Post-Act): Update beliefs with the result of the action
         self.beliefs.update_from_observation(result)
+        self.working_memory.add_observation(result)
 
         # 6. Evaluate Progress
         if self.goals.is_satisfied(self.beliefs):
             logger.info("All active goals satisfied. Terminating agent.")
             self.state = AgentState.FINISHED
             self.memory.add_message(Message.assistant_message("Task Completed"))
+
+            # Consolidation (Chapter 10.5)
+            if self.episodic_store and self.current_episode_actions:
+                active_goal = self.goals.get_active_goal()
+                goal_desc = active_goal.description if active_goal else "Unknown Goal"
+
+                episode = Episode(
+                    goal=goal_desc,
+                    actions=self.current_episode_actions,
+                    outcome="success",
+                    reflection="Task completed successfully.", # Could ask LLM for reflection
+                    timestamp=datetime.datetime.now()
+                )
+                self.episodic_store.save_episode(episode)
+                self.current_episode_actions = [] # Reset
+
             return "Task Completed"
 
-        # Save state after each step
+        # Save state after each step (Atomic Persistence - Chapter 11.5)
         await self.save_state()
 
         return result
@@ -293,14 +434,15 @@ Current Goals:
             "plan": self.intentions.current_plan.model_dump() if self.intentions.current_plan else None,
             "beliefs": self.beliefs.model_dump(),
             "goals": self.goals.model_dump(),
-            # "sandbox_id": "..." # If we had one
+            # Save Working Memory State
+            "working_memory": self.working_memory.model_dump(),
         }
 
+        # Use AtomicState helper
         try:
-            # Using async file write would be better but standard json lib is sync
-            # For simplicity in this iteration:
-            with open(filepath, 'w') as f:
-                json.dump(state_data, f, indent=2, default=str)
+            # We wrap the sync file op in asyncio.to_thread if we want to be fully async,
+            # but here we just call the helper which uses blocking I/O.
+            AtomicState.save(filepath, state_data)
             logger.info(f"Session state saved to {filepath}")
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
@@ -330,6 +472,10 @@ Current Goals:
                 self.goals = GoalSet(**state_data["goals"])
             if "plan" in state_data and state_data["plan"]:
                 self.intentions.set_plan(Plan(**state_data["plan"]))
+
+            # Restore Working Memory
+            if "working_memory" in state_data:
+                self.working_memory = WorkingMemory(**state_data["working_memory"])
 
             logger.info(f"Session state loaded from {filepath}")
         except Exception as e:
