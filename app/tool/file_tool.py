@@ -47,6 +47,14 @@ class FileTool(BaseTool):
                 },
                 "description": "List of edit operations (find/replace).",
             },
+            "start_line": {
+                "type": "integer",
+                "description": "Start line for reading (1-based, inclusive).",
+            },
+            "end_line": {
+                "type": "integer",
+                "description": "End line for reading (1-based, inclusive).",
+            },
         },
         "required": ["action", "path"],
     }
@@ -60,10 +68,10 @@ class FileTool(BaseTool):
              raise ToolError(f"Access denied: {path} is outside the sandbox.")
         return full_path
 
-    async def execute(self, action: str, path: str, content: Optional[str] = None, edits: Optional[List[dict]] = None, **kwargs) -> ToolResult:
+    async def execute(self, action: str, path: str, content: Optional[str] = None, edits: Optional[List[dict]] = None, start_line: Optional[int] = None, end_line: Optional[int] = None, **kwargs) -> ToolResult:
         try:
             if action == "read":
-                text = await self.read(path)
+                text = await self.read(path, start_line, end_line)
                 return ToolResult(output=text)
             elif action == "write":
                 if content is None:
@@ -90,11 +98,40 @@ class FileTool(BaseTool):
         except Exception as e:
             return ToolResult(error=str(e))
 
-    async def read(self, path: PathLike) -> str:
-        """Read content from a file."""
+    async def read(self, path: PathLike, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+        """Read content from a file, optionally restricted to a line range."""
         full_path = self._validate_path(path)
         try:
-            return full_path.read_text(encoding="utf-8")
+            content = full_path.read_text(encoding="utf-8")
+            if start_line is None and end_line is None:
+                return content
+
+            lines = content.splitlines()
+            total_lines = len(lines)
+
+            # Default indices
+            start_idx = 0
+            end_idx = total_lines
+
+            if start_line is not None:
+                if start_line < 1:
+                     raise ToolError("start_line must be >= 1")
+                start_idx = start_line - 1
+
+            if end_line is not None:
+                 end_idx = end_line
+
+            # Slice lines
+            selected_lines = lines[start_idx:end_idx]
+
+            # Add line numbers for context if range is used
+            result = []
+            for i, line in enumerate(selected_lines):
+                current_line_num = start_idx + i + 1
+                result.append(f"{current_line_num:4d} | {line}")
+
+            return "\n".join(result)
+
         except FileNotFoundError:
             raise ToolError(f"File not found: {path}")
         except Exception as e:

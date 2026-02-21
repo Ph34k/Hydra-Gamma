@@ -8,6 +8,7 @@ from app.tool import ToolCollection, Terminate
 from app.tool.search_tool import SearchTool
 from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.file_tool import FileTool
+from app.tool.crm_tool import CRMTool
 
 class SalesAgent(Manus):
     """
@@ -24,9 +25,9 @@ class SalesAgent(Manus):
             SearchTool(),
             BrowserUseTool(),
             FileTool(), # For drafting emails
+            CRMTool(),
             Terminate()
         )
     )
-    # Note: MCP tools (CRM) are loaded dynamically by Manus base class
 
     special_tool_names: List[str] = Field(default_factory=lambda: [Terminate().name])

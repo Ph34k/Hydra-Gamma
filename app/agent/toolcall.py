@@ -19,6 +19,7 @@ from app.agent.rbac import RBACManager, User, UserRole, Action
 from app.agent.secrets import SecretsManager
 from app.agent.safety import EthicalGuard, PromptGuard, ComplianceManager, HallucinationMonitor
 from app.agent.immunity import DigitalImmunitySystem
+from app.agent.rlhf import FeedbackCollector
 from app.utils.audit import AuditLogger
 from app.utils.sanitizer import Sanitizer
 
@@ -60,6 +61,7 @@ class ToolCallAgent(ReActAgent):
     _audit: AuditLogger = PrivateAttr()
     _compliance: ComplianceManager = PrivateAttr()
     _immunity: DigitalImmunitySystem = PrivateAttr()
+    _feedback: FeedbackCollector = PrivateAttr()
     _user: User = PrivateAttr()
     _secrets_lock: asyncio.Lock = PrivateAttr()
 
@@ -71,6 +73,7 @@ class ToolCallAgent(ReActAgent):
         self._audit = AuditLogger()
         self._compliance = ComplianceManager()
         self._immunity = DigitalImmunitySystem()
+        self._feedback = FeedbackCollector()
         self._secrets_lock = asyncio.Lock()
         # Default user context (In a real app, this would be passed in)
         self._user = User(id="default_user", role=UserRole.ENTERPRISE)
@@ -405,6 +408,11 @@ class ToolCallAgent(ReActAgent):
                 return f"Error: {error_msg}"
 
         try:
-            return await super().run(request)
+            result = await super().run(request)
+            return result
         finally:
             await self.cleanup()
+
+    def collect_feedback(self, session_id: str, user_input: str, agent_output: str, rating: int, comment: str = None):
+        """Collect user feedback for RLHF."""
+        self._feedback.collect(session_id, "unknown_task", user_input, agent_output, rating, comment)
