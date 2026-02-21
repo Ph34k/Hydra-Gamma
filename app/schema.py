@@ -155,6 +155,28 @@ class Message(BaseModel):
             **kwargs,
         )
 
+    @classmethod
+    def from_openai_message(cls, message: Any) -> "Message":
+        """Convert an OpenAI message object to a Message instance."""
+        tool_calls = None
+        if message.tool_calls:
+            tool_calls = []
+            for tc in message.tool_calls:
+                tool_calls.append(ToolCall(
+                    id=tc.id,
+                    type=tc.type,
+                    function=Function(
+                        name=tc.function.name,
+                        arguments=tc.function.arguments
+                    )
+                ))
+
+        return cls(
+            role=message.role,
+            content=message.content,
+            tool_calls=tool_calls
+        )
+
 
 class Memory(BaseModel):
     messages: List[Message] = Field(default_factory=list)

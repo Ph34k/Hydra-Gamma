@@ -34,6 +34,7 @@ class Resource(str, Enum):
     PYTHON = "python_execute"
     MEMORY = "memory_search"
     MEDIA = "media_generation_tool"
+    PLANNING = "planning"
 
 class Permission(BaseModel):
     resource: str  # tool_name
@@ -69,6 +70,7 @@ class RBACManager:
                 Permission(resource=Resource.BASH, action=Action.EXEC), # Alias
                 Permission(resource=Resource.FILE, action=Action.READ),
                 Permission(resource=Resource.SEARCH, action=Action.EXEC),
+                Permission(resource=Resource.PLANNING, action=Action.EXEC), # Allow planning for all
             ],
             UserRole.PRO: [
                 Permission(resource=Resource.SHELL, action=Action.EXEC),
@@ -79,6 +81,7 @@ class RBACManager:
                 Permission(resource=Resource.WEBDEV, action=Action.INIT),
                 Permission(resource=Resource.EXPOSE, action=Action.PORT),
                 Permission(resource=Resource.SEARCH, action=Action.EXEC),
+                Permission(resource=Resource.PLANNING, action=Action.EXEC),
             ],
             UserRole.ENTERPRISE: [
                 Permission(resource=Resource.SHELL, action=Action.EXEC),
@@ -97,6 +100,7 @@ class RBACManager:
                 Permission(resource=Resource.PYTHON, action=Action.EXEC),
                 Permission(resource=Resource.MEMORY, action=Action.READ),
                 Permission(resource=Resource.MEDIA, action=Action.EXEC),
+                Permission(resource=Resource.PLANNING, action=Action.EXEC),
             ]
         }
 
