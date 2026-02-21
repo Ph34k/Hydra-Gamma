@@ -1,5 +1,5 @@
 from app.agent.base import BaseAgent
-from app.agent.browser import BrowserAgent
+# from app.agent.browser import BrowserAgent
 from app.agent.mcp import MCPAgent
 from app.agent.react import ReActAgent
 from app.agent.toolcall import ToolCallAgent
@@ -18,7 +18,7 @@ SWEAgent = CodingAgent
 
 __all__ = [
     "BaseAgent",
-    "BrowserAgent",
+    # "BrowserAgent",
     "ReActAgent",
     "ToolCallAgent",
     "MCPAgent",

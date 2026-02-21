@@ -37,6 +37,19 @@ class MediaGenerationTool(BaseTool):
                 "type": "string",
                 "enum": ["PHOTOREALISTIC", "CARTOON", "SKETCH"],
                 "default": "PHOTOREALISTIC",
+                "description": "Style for image generation.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["HTML", "PDF"],
+                "default": "HTML",
+                "description": "Output format for slides.",
+            },
+            "voice_profile": {
+                "type": "string",
+                "enum": ["MALE", "FEMALE", "NEUTRAL"],
+                "default": "NEUTRAL",
+                "description": "Voice profile for audio generation.",
             },
         },
         "required": ["action"],
@@ -51,6 +64,8 @@ class MediaGenerationTool(BaseTool):
         content_path: Optional[str] = None,
         text: Optional[str] = None,
         style: str = "PHOTOREALISTIC",
+        mode: str = "HTML",
+        voice_profile: str = "NEUTRAL",
         **kwargs,
     ) -> ToolResult:
         try:
@@ -61,11 +76,11 @@ class MediaGenerationTool(BaseTool):
             elif action == "generate_slides":
                 if not content_path:
                     return ToolResult(error="Content path required for generate_slides")
-                return await self._generate_slides(content_path)
+                return await self._generate_slides(content_path, mode)
             elif action == "generate_audio":
                 if not text:
                     return ToolResult(error="Text required for generate_audio")
-                return await self._generate_audio(text)
+                return await self._generate_audio(text, voice_profile)
             else:
                 return ToolResult(error=f"Unknown action: {action}")
         except Exception as e:
@@ -80,7 +95,7 @@ class MediaGenerationTool(BaseTool):
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         # Create a placeholder image
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
 
         img = Image.new('RGB', (512, 512), color=(73, 109, 137))
         d = ImageDraw.Draw(img)
@@ -90,7 +105,7 @@ class MediaGenerationTool(BaseTool):
 
         return ToolResult(output=f"Image generated at {path}")
 
-    async def _generate_slides(self, content_path: str) -> ToolResult:
+    async def _generate_slides(self, content_path: str, mode: str) -> ToolResult:
         if not os.path.exists(content_path):
             return ToolResult(error=f"File not found: {content_path}")
 
@@ -120,22 +135,27 @@ class MediaGenerationTool(BaseTool):
 
         slides_html += "</body></html>"
 
-        output_path = content_path.replace(".md", ".html").replace(".txt", ".html")
+        output_path = content_path.replace(".md", f".{mode.lower()}").replace(".txt", f".{mode.lower()}")
         if output_path == content_path:
-            output_path += ".html"
+            output_path += f".{mode.lower()}"
 
-        with open(output_path, "w") as f:
-            f.write(slides_html)
+        if mode == "PDF":
+             # Mock PDF conversion
+             with open(output_path, "w") as f:
+                 f.write(f"PDF content for {content_path}")
+        else:
+            with open(output_path, "w") as f:
+                f.write(slides_html)
 
-        return ToolResult(output=f"Slides generated at {output_path}")
+        return ToolResult(output=f"Slides generated at {output_path} (Mode: {mode})")
 
-    async def _generate_audio(self, text: str) -> ToolResult:
+    async def _generate_audio(self, text: str, voice_profile: str) -> ToolResult:
         # Mock implementation
         filename = f"generated_audio_{hash(text)}.mp3"
         path = os.path.join(os.getcwd(), "generated_media", filename)
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         with open(path, "w") as f:
-            f.write("Audio placeholder content")
+            f.write(f"Audio placeholder content using profile {voice_profile}")
 
         return ToolResult(output=f"Audio generated at {path}")

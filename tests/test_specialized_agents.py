@@ -22,7 +22,7 @@ async def test_research_agent_initialization():
     tool_names = list(agent.available_tools.tool_map.keys())
     # Adjust based on actual names
     assert any("search" in name for name in tool_names)
-    assert "browser_use" in agent.available_tools.tool_map
+    assert "browser_tool" in agent.available_tools.tool_map
     assert "document_processor" in agent.available_tools.tool_map
 
 @pytest.mark.asyncio
@@ -31,7 +31,7 @@ async def test_sales_agent_initialization():
     assert agent.name == "sales_agent"
     tool_names = list(agent.available_tools.tool_map.keys())
     assert any("search" in name for name in tool_names)
-    assert "browser_use" in agent.available_tools.tool_map
+    assert "browser_tool" in agent.available_tools.tool_map
 
 @pytest.mark.asyncio
 async def test_support_agent_initialization():
