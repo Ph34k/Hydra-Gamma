@@ -1,54 +1,71 @@
 import re
 import hashlib
-from typing import Any, Dict, List, Union, Optional
+from typing import Dict, Any, List
 
 class Sanitizer:
     """
-    Sanitizes sensitive information (API keys, passwords, PII) from logs and memory.
-    Chapter 10.6: Privacy and Expiration.
-    Chapter 33: Data Privacy (Anonymization & Pseudonymization).
+    Handles PII redaction and data sanitization.
+    Ref: Chapter 33 of the Technical Bible.
     """
 
-    PATTERNS = [
-        # API Keys & Secrets
-        (r"sk-[a-zA-Z0-9]{20,}", "[OPENAI_KEY_REDACTED]"),
-        (r"ghp_[a-zA-Z0-9]{20,}", "[GITHUB_KEY_REDACTED]"),
-        (r"xox[baprs]-[a-zA-Z0-9]{10,}", "[SLACK_KEY_REDACTED]"),
-        (r"(password|secret|token|key|authorization)\s*[:=]\s*['\"]?([a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};':\\|,.<>/?]+)['\"]?", r"\1=[REDACTED]"),
-        (r"Bearer [a-zA-Z0-9\-\._~\+\/]+", "Bearer [REDACTED]"),
+    # Regex patterns for common PII
+    PATTERNS = {
+        "email": r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        "phone": r"(\+\d{1,3}[-.]?)?\(?\d{3}\)?[-.]?\d{3}[-.]?\d{4}",
+        "cpf": r"\d{3}\.\d{3}\.\d{3}-\d{2}", # Brazilian ID format example
+        "credit_card": r"\b(?:\d{4}[- ]?){3}\d{4}\b",
+        "api_key": r"(sk-[a-zA-Z0-9]{32,})|(ghp_[a-zA-Z0-9]{36})", # OpenAI, GitHub
+    }
 
-        # PII Patterns (Chapter 33)
-        (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "[EMAIL_REDACTED]"), # Email
-        (r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b", "[CPF_REDACTED]"), # CPF (Brazil)
-        (r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b", "[CNPJ_REDACTED]"), # CNPJ (Brazil)
-        (r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}[-\s]?\d{4}|\d{4}[-\s]?\d{4})\b", "[PHONE_REDACTED]"), # Phone (BR)
-        (r"\b(?:\d{4}[-\s]?){3}\d{4}\b", "[CREDIT_CARD_REDACTED]"), # Simple Credit Card Match
-    ]
+    def sanitize_text(self, text: str) -> str:
+        """Redact PII from text."""
+        if not text:
+            return ""
+
+        sanitized = text
+        for label, pattern in self.PATTERNS.items():
+            sanitized = re.sub(pattern, f"[REDACTED_{label.upper()}]", sanitized)
+
+        return sanitized
+
+    def sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively sanitize dictionary values."""
+        new_data = {}
+        for k, v in data.items():
+            if isinstance(v, str):
+                new_data[k] = self.sanitize_text(v)
+            elif isinstance(v, dict):
+                new_data[k] = self.sanitize_dict(v)
+            elif isinstance(v, list):
+                new_data[k] = [self.sanitize_text(i) if isinstance(i, str) else i for i in v]
+            else:
+                new_data[k] = v
+        return new_data
 
     @staticmethod
-    def sanitize(data: Union[str, Dict, List]) -> Union[str, Dict, List]:
-        """
-        Removes sensitive information using regex patterns (Anonymization).
-        """
-        if isinstance(data, str):
-            # Check if it looks like a JSON string to avoid breaking structure if we were more aggressive
-            # But here we are just replacing values.
-            sanitized = data
-            for pattern, replacement in Sanitizer.PATTERNS:
-                sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
-            return sanitized
-        elif isinstance(data, dict):
-            return {k: Sanitizer.sanitize(v) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [Sanitizer.sanitize(item) for item in data]
+    def sanitize(data: Any) -> Any:
+        """Static wrapper for convenience/compatibility."""
+        s = Sanitizer()
+        if isinstance(data, dict):
+            return s.sanitize_dict(data)
+        elif isinstance(data, str):
+            return s.sanitize_text(data)
         return data
 
     @staticmethod
-    def pseudonymize(data: str, salt: Optional[str] = "") -> str:
+    def pseudonymize(text: str) -> str:
+        """Pseudonymize text using SHA256 hash."""
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    def forget_user_data(self, user_id: str):
         """
-        Replaces a value with a deterministic hash (Pseudonymization).
-        Useful for tracking entities without revealing their identity.
+        Implement 'Right to Forget'.
+        This would typically interface with databases to delete user records.
+        For now, it's a placeholder interface.
         """
-        if not data:
-            return ""
-        return hashlib.sha256((str(data) + (salt or "")).encode()).hexdigest()
+        # TODO: Connect to episodic/semantic memory and delete records tagged with user_id
+        # Example: self.episodic_store.delete_by_user(user_id)
+        pass
+
+# Global instance
+sanitizer = Sanitizer()
