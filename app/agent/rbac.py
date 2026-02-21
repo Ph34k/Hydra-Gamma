@@ -28,6 +28,12 @@ class Resource(str, Enum):
     EXPOSE = "expose"
     MCP = "mcp_tool"
     SCHEDULE = "schedule_tool"
+    GIT = "git_tool"
+    CRM = "crm_tool"
+    DELEGATE = "delegate_task"
+    PYTHON = "python_execute"
+    MEMORY = "memory_search"
+    MEDIA = "media_generation_tool"
 
 class Permission(BaseModel):
     resource: str  # tool_name
@@ -85,6 +91,12 @@ class RBACManager:
                 Permission(resource=Resource.SEARCH, action=Action.EXEC),
                 Permission(resource=Resource.MCP, action=Action.CALL),
                 Permission(resource=Resource.SCHEDULE, action=Action.CRON),
+                Permission(resource=Resource.GIT, action=Action.EXEC),
+                Permission(resource=Resource.CRM, action=Action.EXEC),
+                Permission(resource=Resource.DELEGATE, action=Action.EXEC),
+                Permission(resource=Resource.PYTHON, action=Action.EXEC),
+                Permission(resource=Resource.MEMORY, action=Action.READ),
+                Permission(resource=Resource.MEDIA, action=Action.EXEC),
             ]
         }
 

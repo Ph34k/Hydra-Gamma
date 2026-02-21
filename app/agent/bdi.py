@@ -1,4 +1,5 @@
 from typing import List, Optional, Dict, Any, Union
+from enum import Enum
 from pydantic import BaseModel, Field
 import datetime
 
@@ -83,7 +84,13 @@ class GoalSet(BaseModel):
             return False
         return all(g.status == "completed" for g in self.active_goals)
 
-class Phase(BaseModel):
+class Phase(str, Enum):
+    PERCEPTION = "PERCEPTION"
+    ACTION = "ACTION"
+    PLANNING = "PLANNING"
+    DELIBERATION = "DELIBERATION"
+
+class PlanStep(BaseModel):
     id: int
     title: str
     description: str
@@ -91,7 +98,7 @@ class Phase(BaseModel):
 
 class Plan(BaseModel):
     goal: str
-    phases: List[Phase] = Field(default_factory=list)
+    phases: List[PlanStep] = Field(default_factory=list)
     current_phase_id: Optional[int] = None
 
     def update(self, new_plan: "Plan"):
@@ -118,6 +125,7 @@ class Plan(BaseModel):
 
 class IntentionPool(BaseModel):
     current_plan: Optional[Plan] = None
+    current_phase: Phase = Phase.PERCEPTION
 
     def set_plan(self, plan: Plan):
         self.current_plan = plan
