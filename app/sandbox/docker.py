@@ -36,8 +36,8 @@ class DockerSandbox:
                 detach=True,
                 mem_limit=self.memory_limit,
                 working_dir=self.working_dir,
-                # pids_limit=512, # Chapter 17
-                # cpu_quota=50000, # 50% CPU
+                pids_limit=512, # Chapter 17
+                cpu_quota=50000, # 50% CPU
                 # network_mode="none", # Strict isolation by default, but we might need net for tools
                 volumes={
                      # We might want to mount a volume for persistence if needed,
@@ -45,7 +45,11 @@ class DockerSandbox:
                 }
             )
             self.container_id = self.container.id
-            self.monitor = ResourceMonitor(UUID(int=0), limits={"timeout": self.timeout}) # Mock UUID
+            self.monitor = ResourceMonitor(
+                UUID(int=0),
+                limits={"timeout": self.timeout},
+                container_id=self.container_id
+            )
 
             # Setup workspace
             self.exec_run(f"mkdir -p {self.working_dir}")
