@@ -6,7 +6,7 @@ from app.agent.manus import Manus
 from app.prompt.specialized import SALES_AGENT_PROMPT
 from app.tool import ToolCollection, Terminate
 from app.tool.search_tool import SearchTool
-from app.tool.browser_use_tool import BrowserUseTool
+from app.tool.browser_tool import BrowserTool
 from app.tool.file_tool import FileTool
 from app.tool.crm_tool import CRMTool
 
@@ -23,7 +23,7 @@ class SalesAgent(Manus):
     available_tools: ToolCollection = Field(
         default_factory=lambda: ToolCollection(
             SearchTool(),
-            BrowserUseTool(),
+            BrowserTool(),
             FileTool(), # For drafting emails
             CRMTool(),
             Terminate()

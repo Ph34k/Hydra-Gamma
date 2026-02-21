@@ -6,7 +6,7 @@ from app.agent.manus import Manus
 from app.prompt.specialized import RESEARCH_AGENT_PROMPT
 from app.tool import ToolCollection, Terminate
 from app.tool.search_tool import SearchTool
-from app.tool.browser_use_tool import BrowserUseTool
+from app.tool.browser_tool import BrowserTool
 from app.tool.document_processor import DocumentProcessor
 from app.tool.file_tool import FileTool
 
@@ -23,7 +23,7 @@ class ResearchAgent(Manus):
     available_tools: ToolCollection = Field(
         default_factory=lambda: ToolCollection(
             SearchTool(),
-            BrowserUseTool(),
+            BrowserTool(),
             DocumentProcessor(),
             FileTool(), # Needed for saving reports
             Terminate()

@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Any
 from pydantic import Field, model_validator
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
-from app.agent.browser import BrowserContextHelper
 from app.agent.toolcall import ToolCallAgent
 from app.agent.reasoning import ReasoningEngine
 from app.agent.memory import ContextManager
@@ -17,7 +16,7 @@ from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import AgentState, Message, ToolCall
 from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
-from app.tool.browser_use_tool import BrowserUseTool
+from app.tool.browser_tool import BrowserTool
 from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
@@ -83,7 +82,7 @@ class Manus(ToolCallAgent):
     available_tools: ToolCollection = Field(
         default_factory=lambda: ToolCollection(
             PythonExecute(),
-            BrowserUseTool(),
+            BrowserTool(), # Replaced BrowserUseTool with BrowserTool
             StrReplaceEditor(),
             AskHuman(),
             Terminate(),
@@ -94,7 +93,6 @@ class Manus(ToolCallAgent):
     )
 
     special_tool_names: list[str] = Field(default_factory=lambda: [Terminate().name])
-    browser_context_helper: Optional[BrowserContextHelper] = None
     planning_tool: Optional[PlanningTool] = None # Reference to PlanningTool instance
 
     # Track connected MCP servers
@@ -109,7 +107,6 @@ class Manus(ToolCallAgent):
     @model_validator(mode="after")
     def initialize_helper(self) -> "Manus":
         """Initialize basic components synchronously."""
-        self.browser_context_helper = BrowserContextHelper(self)
         if hasattr(self, 'llm') and self.llm:
              self.reasoning_engine = ReasoningEngine(self.llm)
              self.context_manager = ContextManager(self.llm)
@@ -224,8 +221,11 @@ class Manus(ToolCallAgent):
 
     async def cleanup(self):
         """Clean up Manus agent resources."""
-        if self.browser_context_helper:
-            await self.browser_context_helper.cleanup_browser()
+        # Clean up browser tool if present
+        browser_tool = self.available_tools.tool_map.get("browser_tool")
+        if browser_tool and hasattr(browser_tool, "cleanup"):
+            await browser_tool.cleanup()
+
         # Disconnect from all MCP servers only if we were initialized
         if self._initialized:
             await self.disconnect_mcp_server()
@@ -396,18 +396,8 @@ Current Plan:
         original_prompt = self.next_step_prompt
         self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}{plan_notification}"
 
-        recent_messages = self.memory.messages[-3:] if self.memory.messages else []
-        browser_in_use = any(
-            tc.function.name == BrowserUseTool().name
-            for msg in recent_messages
-            if msg.tool_calls
-            for tc in msg.tool_calls
-        )
-
-        if browser_in_use:
-            browser_prompt = await self.browser_context_helper.format_next_step_prompt()
-            if browser_prompt:
-                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}{reasoning_strategy_output}{plan_notification}"
+        # NOTE: Removed BrowserContextHelper logic as it is specific to browser-use-tool
+        # The new BrowserTool returns state/content directly in its output.
 
         try:
             # Delegate to ToolCallAgent.think to interact with LLM and select tools
