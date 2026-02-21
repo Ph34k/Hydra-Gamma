@@ -21,7 +21,7 @@ from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
-from app.agent.bdi import BeliefSet, GoalSet, IntentionPool, Plan, Phase
+from app.agent.bdi import BeliefSet, GoalSet, IntentionPool, Plan, Phase, PlanStep
 
 # New Memory Components
 from app.memory.working import WorkingMemory
@@ -36,6 +36,7 @@ from app.agent.router import Router, TaskPhase
 from app.agent.budget import BudgetManager
 from app.tool.shell_tool import ShellTool
 from app.tool.file_tool import FileTool
+from app.tool.planning import PlanningTool
 
 
 class Manus(ToolCallAgent):
@@ -88,11 +89,13 @@ class Manus(ToolCallAgent):
             Terminate(),
             MemorySearchTool(), # Add Memory Search Tool
             ShellTool(), # New Shell Tool
+            PlanningTool(), # Add Planning Tool
         )
     )
 
     special_tool_names: list[str] = Field(default_factory=lambda: [Terminate().name])
     browser_context_helper: Optional[BrowserContextHelper] = None
+    planning_tool: Optional[PlanningTool] = None # Reference to PlanningTool instance
 
     # Track connected MCP servers
     connected_servers: Dict[str, str] = Field(
@@ -129,6 +132,12 @@ class Manus(ToolCallAgent):
                 mem_tool = self.available_tools.tool_map.get("memory_search")
                 if mem_tool and isinstance(mem_tool, MemorySearchTool):
                     mem_tool.set_memory(self.semantic_memory)
+
+                # Get reference to PlanningTool
+                plan_tool = self.available_tools.tool_map.get("planning")
+                if plan_tool and isinstance(plan_tool, PlanningTool):
+                    self.planning_tool = plan_tool
+
         except Exception as e:
             logger.warning(f"Memory components failed to initialize (likely due to missing deps or environment): {e}")
 
@@ -292,6 +301,33 @@ class Manus(ToolCallAgent):
              for k, v in snapshot.items():
                  self.working_memory.update_state(k, v)
 
+        # Sync Plan from PlanningTool
+        if self.planning_tool:
+             plan_data = self.planning_tool.get_active_plan_data()
+             if plan_data:
+                 # Convert to bdi.Plan
+                 phases = []
+                 for i, step_text in enumerate(plan_data['steps']):
+                     # Default status mapping if key missing
+                     status = plan_data.get('step_statuses', [])[i] if i < len(plan_data.get('step_statuses', [])) else "pending"
+                     if status == "not_started": status = "pending"
+
+                     phases.append(PlanStep(
+                         id=i+1,
+                         title=step_text[:50], # Truncate for title
+                         description=step_text,
+                         status=status
+                     ))
+
+                 new_plan = Plan(goal=plan_data['title'], phases=phases)
+                 # Determine current phase
+                 for phase in phases:
+                     if phase.status == "in_progress":
+                         new_plan.current_phase_id = phase.id
+                         break
+
+                 self.intentions.set_plan(new_plan)
+
 
         # 2. Deliberation: Decide on goals (Desires)
         if not self.goals.active_goals and self.memory.messages:
@@ -313,16 +349,20 @@ class Manus(ToolCallAgent):
                     self.working_memory.scratchpad += f"\n\n[Memory Injection]\n{examples}"
 
         # 3. Planning: Generate or Refine Plan (Intentions)
-        current_plan_json = self.intentions.current_plan.model_dump_json() if self.intentions.current_plan else "No plan yet."
-        active_goals_desc = [g.description for g in self.goals.active_goals]
+        current_plan_json = self.intentions.current_plan.model_dump_json() if self.intentions.current_plan else "No active plan."
+
+        # Determine notification if plan is missing
+        plan_notification = ""
+        if not self.intentions.current_plan and self.goals.active_goals:
+            plan_notification = "\n\n[System Notification]\nYou have an active goal but no plan. You MUST use the `planning` tool (command: create) to create a plan before proceeding."
+        elif self.intentions.current_plan:
+             # Check if we should refine or advance
+             pass
 
         # Update Working Memory History (syncing with agent memory)
-        # Note: In a full refactor, we would use working_memory.recent_history directly.
-        # Here we just ensure working_memory has access if needed, but we rely on 'messages' for LLM call.
         self.working_memory.recent_history = self.memory.messages[-10:] # Keep last 10 in working memory view
 
         # Construct Context using Working Memory (Chapter 8)
-        # We replace the raw BDI context with the sophisticated Working Memory Context
         working_memory_context = self.working_memory.get_active_context()
 
         bdi_context = f"""
@@ -354,7 +394,7 @@ Current Plan:
             # self.llm.switch_model(selected_tier.value)
 
         original_prompt = self.next_step_prompt
-        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}"
+        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}{plan_notification}"
 
         recent_messages = self.memory.messages[-3:] if self.memory.messages else []
         browser_in_use = any(
@@ -367,7 +407,7 @@ Current Plan:
         if browser_in_use:
             browser_prompt = await self.browser_context_helper.format_next_step_prompt()
             if browser_prompt:
-                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}{reasoning_strategy_output}"
+                self.next_step_prompt = f"{browser_prompt}\n\n{bdi_context}{reasoning_strategy_output}{plan_notification}"
 
         try:
             # Delegate to ToolCallAgent.think to interact with LLM and select tools
@@ -436,7 +476,9 @@ Current Plan:
         self.working_memory.add_observation(result)
 
         # 6. Evaluate Progress
-        if self.goals.is_satisfied(self.beliefs):
+        # Check satisfaction with LLM
+        is_satisfied = await self.goals.is_satisfied(self.beliefs, self.llm)
+        if is_satisfied:
             logger.info("All active goals satisfied. Terminating agent.")
             self.state = AgentState.FINISHED
             self.memory.add_message(Message.assistant_message("Task Completed"))
@@ -513,6 +555,25 @@ Current Plan:
                 self.goals = GoalSet(**state_data["goals"])
             if "plan" in state_data and state_data["plan"]:
                 self.intentions.set_plan(Plan(**state_data["plan"]))
+
+                # Sync PlanningTool from restored plan
+                if self.planning_tool and self.intentions.current_plan:
+                    plan = self.intentions.current_plan
+                    # Convert statuses "pending" -> "not_started" if needed
+                    statuses = []
+                    for p in plan.phases:
+                        s = p.status
+                        if s == "pending": s = "not_started"
+                        statuses.append(s)
+
+                    tool_data = {
+                        "plan_id": "main",
+                        "title": plan.goal,
+                        "steps": [p.description for p in plan.phases],
+                        "step_statuses": statuses,
+                        "step_notes": [""] * len(plan.phases)
+                    }
+                    self.planning_tool.set_active_plan_data(tool_data)
 
             # Restore Working Memory
             if "working_memory" in state_data:

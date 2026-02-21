@@ -1,5 +1,5 @@
-# tool/planning.py
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Any, Union
+import json
 
 from app.exceptions import ToolError
 from app.tool.base import BaseTool, ToolResult
@@ -69,6 +69,21 @@ class PlanningTool(BaseTool):
     plans: dict = {}  # Dictionary to store plans by plan_id
     _current_plan_id: Optional[str] = None  # Track the current active plan
 
+    def get_active_plan_data(self) -> Optional[Dict[str, Any]]:
+        """Return the raw data of the active plan."""
+        if self._current_plan_id and self._current_plan_id in self.plans:
+            return self.plans[self._current_plan_id]
+        return None
+
+    def set_active_plan_data(self, plan_data: Dict[str, Any]):
+        """Set the active plan data directly (for state restoration)."""
+        if not plan_data:
+            return
+        plan_id = plan_data.get("plan_id")
+        if plan_id:
+            self.plans[plan_id] = plan_data
+            self._current_plan_id = plan_id
+
     async def execute(
         self,
         *,
@@ -87,15 +102,6 @@ class PlanningTool(BaseTool):
     ):
         """
         Execute the planning tool with the given command and parameters.
-
-        Parameters:
-        - command: The operation to perform
-        - plan_id: Unique identifier for the plan
-        - title: Title for the plan (used with create command)
-        - steps: List of steps for the plan (used with create command)
-        - step_index: Index of the step to update (used with mark_step command)
-        - step_status: Status to set for a step (used with mark_step command)
-        - step_notes: Additional notes for a step (used with mark_step command)
         """
 
         if command == "create":
@@ -122,24 +128,23 @@ class PlanningTool(BaseTool):
     ) -> ToolResult:
         """Create a new plan with the given ID, title, and steps."""
         if not plan_id:
-            raise ToolError("Parameter `plan_id` is required for command: create")
+            # Generate a simple plan_id if not provided, or require it.
+            # For simplicity, let's require it or default to 'main'
+            plan_id = "main"
 
         if plan_id in self.plans:
-            raise ToolError(
-                f"A plan with ID '{plan_id}' already exists. Use 'update' to modify existing plans."
-            )
+            # If it exists, update it or error? Let's error to be safe, or just overwrite if force?
+            # Creating a new plan with same ID usually implies overwrite in agent context.
+            pass
 
         if not title:
-            raise ToolError("Parameter `title` is required for command: create")
+             title = "Plan"
 
-        if (
-            not steps
-            or not isinstance(steps, list)
-            or not all(isinstance(step, str) for step in steps)
-        ):
-            raise ToolError(
-                "Parameter `steps` must be a non-empty list of strings for command: create"
-            )
+        if not steps:
+             steps = []
+
+        if not isinstance(steps, list) or not all(isinstance(step, str) for step in steps):
+             raise ToolError("Parameter `steps` must be a list of strings for command: create")
 
         # Create a new plan with initialized step statuses
         plan = {
@@ -162,7 +167,10 @@ class PlanningTool(BaseTool):
     ) -> ToolResult:
         """Update an existing plan with new title or steps."""
         if not plan_id:
-            raise ToolError("Parameter `plan_id` is required for command: update")
+            if self._current_plan_id:
+                plan_id = self._current_plan_id
+            else:
+                raise ToolError("Parameter `plan_id` is required for command: update")
 
         if plan_id not in self.plans:
             raise ToolError(f"No plan found with ID: {plan_id}")
@@ -180,7 +188,10 @@ class PlanningTool(BaseTool):
                     "Parameter `steps` must be a list of strings for command: update"
                 )
 
-            # Preserve existing step statuses for unchanged steps
+            # Preserve existing step statuses for unchanged steps logic...
+            # This logic is tricky if steps are reordered or changed slightly.
+            # Simplified approach: If steps are provided, reset statuses for new steps.
+
             old_steps = plan["steps"]
             old_statuses = plan["step_statuses"]
             old_notes = plan["step_notes"]
@@ -190,11 +201,12 @@ class PlanningTool(BaseTool):
             new_notes = []
 
             for i, step in enumerate(steps):
-                # If the step exists at the same position in old steps, preserve status and notes
-                if i < len(old_steps) and step == old_steps[i]:
-                    new_statuses.append(old_statuses[i])
-                    new_notes.append(old_notes[i])
-                else:
+                # Try to find exact match in old steps to preserve status
+                try:
+                    old_idx = old_steps.index(step)
+                    new_statuses.append(old_statuses[old_idx])
+                    new_notes.append(old_notes[old_idx])
+                except ValueError:
                     new_statuses.append("not_started")
                     new_notes.append("")
 
@@ -263,12 +275,10 @@ class PlanningTool(BaseTool):
     ) -> ToolResult:
         """Mark a step with a specific status and optional notes."""
         if not plan_id:
-            # If no plan_id is provided, use the current active plan
-            if not self._current_plan_id:
-                raise ToolError(
-                    "No active plan. Please specify a plan_id or set an active plan."
-                )
-            plan_id = self._current_plan_id
+            if self._current_plan_id:
+                plan_id = self._current_plan_id
+            else:
+                 raise ToolError("No active plan. Please specify a plan_id.")
 
         if plan_id not in self.plans:
             raise ToolError(f"No plan found with ID: {plan_id}")

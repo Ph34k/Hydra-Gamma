@@ -2,6 +2,8 @@ from typing import List, Optional, Dict, Any, Union
 from enum import Enum
 from pydantic import BaseModel, Field
 import datetime
+import json
+from app.schema import Message
 
 class Fact(BaseModel):
     content: str
@@ -27,14 +29,15 @@ class BeliefSet(BaseModel):
 
     def prune_facts(self):
         """Keep only the most recent facts to avoid context overflow."""
+        # Simple sliding window for now as per Bible 4.2 (L2 Memory)
         if len(self.facts) > self.max_facts:
+            # TODO: In future, use LLM to summarize older facts into L3 memory
             self.facts = self.facts[-self.max_facts:]
 
     def sync_with_environment(self, snapshot: Dict[str, Any]):
         self.environment_snapshot.update(snapshot)
 
     def get_summary(self) -> str:
-        # Simple summary for now, can be enhanced with LLM summarization later
         summary = "Current Beliefs:\n"
         # Show recent facts, but limit characters if needed
         for fact in self.facts[-10:]: # Show last 10 facts
@@ -43,7 +46,7 @@ class BeliefSet(BaseModel):
             # Format environment snapshot nicely
             env_str = f"PWD: {self.environment_snapshot.get('pwd', 'unknown')}\n"
             if 'ls' in self.environment_snapshot:
-                env_str += f"Files: {', '.join(self.environment_snapshot['ls'])}\n"
+                env_str += f"Files: {', '.join(str(x) for x in self.environment_snapshot.get('ls', []))}\n"
             summary += f"Environment: \n{env_str}\n"
         return summary
 
@@ -52,10 +55,30 @@ class Goal(BaseModel):
     status: str = "pending" # pending, active, completed, failed
     priority: int = 1
 
-    def is_satisfied(self, beliefs: BeliefSet) -> bool:
-        # Logic to check if goal is satisfied based on beliefs
-        # This is a placeholder. Real implementation would likely involve LLM checking.
-        return self.status == "completed"
+    async def is_satisfied(self, beliefs: BeliefSet, llm: Any) -> bool:
+        if self.status == "completed":
+            return True
+
+        # Use LLM to verify if goal is met
+        prompt = f"""
+        Goal: {self.description}
+
+        Current Beliefs (Observations & State):
+        {beliefs.get_summary()}
+
+        Based on the current beliefs, has this goal been achieved?
+        If yes, reply with 'YES'.
+        If no, reply with 'NO'.
+        """
+        try:
+            response = await llm.ask([Message.user_message(prompt)], stream=False)
+            if "YES" in response.strip().upper():
+                self.status = "completed"
+                return True
+        except Exception:
+            pass # Default to False on error
+
+        return False
 
 class GoalSet(BaseModel):
     active_goals: List[Goal] = Field(default_factory=list)
@@ -77,12 +100,19 @@ class GoalSet(BaseModel):
             return pending[0]
         return None
 
-    def is_satisfied(self, beliefs: BeliefSet) -> bool:
+    async def is_satisfied(self, beliefs: BeliefSet, llm: Any = None) -> bool:
         # Check if all active goals are satisfied
-        # If no active goals, it's NOT satisfied yet (waiting for goals)
         if not self.active_goals:
             return False
-        return all(g.status == "completed" for g in self.active_goals)
+
+        for goal in self.active_goals:
+            if goal.status != "completed":
+                # If LLM is provided, check dynamically
+                if llm and await goal.is_satisfied(beliefs, llm):
+                    continue # Goal is satisfied, check next
+                return False # Found an unsatisfied goal
+
+        return True
 
 class Phase(str, Enum):
     PERCEPTION = "PERCEPTION"
@@ -130,9 +160,50 @@ class IntentionPool(BaseModel):
     def set_plan(self, plan: Plan):
         self.current_plan = plan
 
-    def generate_plan(self, goal: Goal, beliefs: BeliefSet):
-        # Placeholder for plan generation logic
-        pass
+    async def generate_plan(self, goal: Goal, beliefs: BeliefSet, llm: Any) -> Optional[Plan]:
+        """Generate a plan using the LLM based on the goal and beliefs."""
+        prompt = f"""
+        You are an expert planner. Create a step-by-step plan to achieve the following goal.
+
+        Goal: {goal.description}
+
+        Context:
+        {beliefs.get_summary()}
+
+        Return a JSON object with the following structure:
+        {{
+            "goal": "{goal.description}",
+            "phases": [
+                {{
+                    "id": 1,
+                    "title": "Phase Title",
+                    "description": "Detailed description of what to do",
+                    "status": "pending"
+                }},
+                ...
+            ]
+        }}
+        """
+        try:
+            response = await llm.ask([Message.user_message(prompt)], stream=False)
+            # Basic cleaning of markdown code blocks if present
+            clean_response = response.replace("```json", "").replace("```", "").strip()
+            plan_data = json.loads(clean_response)
+
+            # Convert to Plan object
+            plan = Plan(goal=plan_data["goal"], phases=[PlanStep(**p) for p in plan_data["phases"]])
+
+            # Initialize first step
+            if plan.phases:
+                plan.current_phase_id = plan.phases[0].id
+                plan.phases[0].status = "in_progress"
+
+            self.current_plan = plan
+            return plan
+        except Exception as e:
+            # Fallback or log error
+            print(f"Plan generation failed: {e}")
+            return None
 
     def refine_plan(self):
         # Placeholder for plan refinement logic
