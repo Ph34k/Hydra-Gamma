@@ -27,6 +27,7 @@ from app.tool.memory import MemorySearchTool
 # New Intelligence & Architecture Components
 from app.agent.router import Router, TaskPhase
 from app.agent.budget import BudgetManager
+from app.agent.recovery import RecoveryManager, RecoveryStrategy
 from app.tool.planning import PlanningTool
 
 
@@ -62,6 +63,7 @@ class AgentCore(ToolCallAgent):
     # Intelligence Components (Chapter 13)
     router: Optional[Router] = None
     budget_manager: Optional[BudgetManager] = None
+    recovery_manager: Optional[RecoveryManager] = None
 
     # Reasoning & Memory
     reasoning_engine: Optional[ReasoningEngine] = None
@@ -90,6 +92,7 @@ class AgentCore(ToolCallAgent):
         # Initialize Intelligence
         self.router = Router()
         self.budget_manager = BudgetManager(limits={"default": 100.0})
+        self.recovery_manager = RecoveryManager()
 
         # Initialize Memories
         try:
@@ -290,12 +293,46 @@ Current Plan:
             success = True
             error_msg = None
         except Exception as e:
-            result = f"Error: {str(e)}"
-            success = False
             error_msg = str(e)
+            success = False
+
+            # Recovery Logic
+            if self.recovery_manager and current_calls:
+                # Analyze the first tool call that likely caused the error
+                # In a multi-tool scenario, this is a simplification
+                failed_tool = current_calls[0].function.name
+                failed_args = json.loads(current_calls[0].function.arguments or "{}")
+
+                recovery_plan = self.recovery_manager.analyze_error(error_msg, failed_tool, failed_args)
+                logger.warning(f"Recovery Plan Triggered: {recovery_plan.category} -> {recovery_plan.strategy}")
+
+                if recovery_plan.strategy == RecoveryStrategy.RETRY:
+                    # For simple retry, we return the error as observation so the LLM loops back
+                    # But we might want to automatically retry here?
+                    # The standard pattern is to return the error to the LLM so it can decide.
+                    # But we inject the recovery advice.
+                    result = f"Error: {error_msg}\n[System Advice]: {recovery_plan.reasoning}"
+
+                elif recovery_plan.strategy == RecoveryStrategy.RETRY_WITH_DELAY:
+                    await asyncio.sleep(5) # Exponential backoff placeholder
+                    result = f"Error: {error_msg}\n[System Advice]: Operation timed out. Paused for 5s. {recovery_plan.reasoning}"
+
+                elif recovery_plan.strategy == RecoveryStrategy.MODIFY_ARGS:
+                    result = f"Error: {error_msg}\n[System Advice]: {recovery_plan.reasoning}"
+
+                elif recovery_plan.strategy == RecoveryStrategy.ASK_USER:
+                    result = f"Error: {error_msg}\n[System Advice]: CRITICAL FAILURE. Please ask the user for help."
+                else:
+                    result = f"Error: {error_msg}"
+            else:
+                result = f"Error: {error_msg}"
+
             if self.router:
                 self.router.report_failure(self.session_id)
-            raise e
+
+            # We do NOT raise e here, we return the result (error description)
+            # so the agent can perceive it and re-plan in the next think() cycle.
+            # Unless it's a fatal system error.
 
         duration = time.time() - start_time
 
