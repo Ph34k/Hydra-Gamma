@@ -5,7 +5,12 @@ import time
 import json
 from typing import Dict, List, Optional, Any
 from pydantic import Field, model_validator
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from tenacity import (
+    retry,
+    wait_exponential,
+    stop_after_attempt,
+    retry_if_exception_type
+)
 
 from app.agent.toolcall import ToolCallAgent
 from app.agent.reasoning import ReasoningEngine
@@ -70,7 +75,9 @@ class AgentCore(ToolCallAgent):
     context_manager: Optional[ContextManager] = None
 
     # Persistence
-    session_id: str = Field(default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+    session_id: str = Field(
+        default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    )
 
     # Planning Tool Reference
     planning_tool: Optional[PlanningTool] = None
@@ -82,8 +89,8 @@ class AgentCore(ToolCallAgent):
     def initialize_core_components(self) -> "AgentCore":
         """Initialize BDI and Core components."""
         if hasattr(self, 'llm') and self.llm:
-             self.reasoning_engine = ReasoningEngine(self.llm)
-             self.context_manager = ContextManager(self.llm)
+            self.reasoning_engine = ReasoningEngine(self.llm)
+            self.context_manager = ContextManager(self.llm)
 
         # Initialize Monitors
         self.state_monitor = StateMonitor()
@@ -123,7 +130,10 @@ class AgentCore(ToolCallAgent):
         try:
             snapshot["pwd"] = os.getcwd()
             snapshot["ls"] = os.listdir(os.getcwd())[:20]
-            snapshot["env"] = {k: v for k, v in os.environ.items() if k in ["USER", "HOME", "PATH", "LANG"]}
+            snapshot["env"] = {
+                k: v for k, v in os.environ.items()
+                if k in ["USER", "HOME", "PATH", "LANG"]
+            }
         except Exception as e:
             logger.error(f"Failed to get environment snapshot: {e}")
         return snapshot
@@ -149,9 +159,9 @@ class AgentCore(ToolCallAgent):
 
         # Ensure helper components are initialized
         if not self.reasoning_engine and self.llm:
-             self.reasoning_engine = ReasoningEngine(self.llm)
+            self.reasoning_engine = ReasoningEngine(self.llm)
         if not self.context_manager and self.llm:
-             self.context_manager = ContextManager(self.llm)
+            self.context_manager = ContextManager(self.llm)
 
         # 0. Context Management (Chapter 4)
         if self.context_manager:
@@ -166,46 +176,51 @@ class AgentCore(ToolCallAgent):
 
         # 1. Perception: Sync Beliefs (Chapter 1.3.1)
         if self.state_monitor and self.state_monitor.check_heartbeat():
-             snapshot = self.state_monitor.get_snapshot()
-             self.beliefs.sync_with_environment(snapshot)
-             for k, v in snapshot.items():
-                 self.working_memory.update_state(k, v)
+            snapshot = self.state_monitor.get_snapshot()
+            self.beliefs.sync_with_environment(snapshot)
+            for k, v in snapshot.items():
+                self.working_memory.update_state(k, v)
         else:
-             snapshot = self._get_environment_snapshot()
-             self.beliefs.sync_with_environment(snapshot)
-             for k, v in snapshot.items():
-                 self.working_memory.update_state(k, v)
+            snapshot = self._get_environment_snapshot()
+            self.beliefs.sync_with_environment(snapshot)
+            for k, v in snapshot.items():
+                self.working_memory.update_state(k, v)
 
         # Sync Plan from PlanningTool
         if self.planning_tool:
-             plan_data = self.planning_tool.get_active_plan_data()
-             if plan_data:
-                 phases = []
-                 for i, step_text in enumerate(plan_data['steps']):
-                     status = plan_data.get('step_statuses', [])[i] if i < len(plan_data.get('step_statuses', [])) else "pending"
-                     if status == "not_started": status = "pending"
+            plan_data = self.planning_tool.get_active_plan_data()
+            if plan_data:
+                phases = []
+                for i, step_text in enumerate(plan_data['steps']):
+                    statuses = plan_data.get('step_statuses', [])
+                    status = statuses[i] if i < len(statuses) else "pending"
+                    if status == "not_started":
+                        status = "pending"
 
-                     phases.append(PlanStep(
-                         id=i+1,
-                         title=step_text[:50],
-                         description=step_text,
-                         status=status
-                     ))
+                    phases.append(PlanStep(
+                        id=i + 1,
+                        title=step_text[:50],
+                        description=step_text,
+                        status=status
+                    ))
 
-                 new_plan = Plan(goal=plan_data['title'], phases=phases)
-                 for phase in phases:
-                     if phase.status == "in_progress":
-                         new_plan.current_phase_id = phase.id
-                         break
+                new_plan = Plan(goal=plan_data['title'], phases=phases)
+                for phase in phases:
+                    if phase.status == "in_progress":
+                        new_plan.current_phase_id = phase.id
+                        break
 
-                 self.intentions.set_plan(new_plan)
+                self.intentions.set_plan(new_plan)
 
         # 2. Deliberation: Decide on Desires (Goals)
         if not self.goals.active_goals and self.memory.messages:
-             last_user_msg = next((m for m in reversed(self.memory.messages) if m.role == "user"), None)
-             if last_user_msg:
-                 self.goals.add_goal(last_user_msg.content)
-                 self.goals.get_active_goal() # Activate it
+            last_user_msg = next(
+                (m for m in reversed(self.memory.messages) if m.role == "user"),
+                None
+            )
+            if last_user_msg:
+                self.goals.add_goal(last_user_msg.content)
+                self.goals.get_active_goal()  # Activate it
 
         active_goal = self.goals.get_active_goal()
         if active_goal:
@@ -213,18 +228,30 @@ class AgentCore(ToolCallAgent):
 
             # Few-Shot Injection (Chapter 10)
             if self.episodic_store and not self.working_memory.scratchpad:
-                examples = self.episodic_store.get_formatted_examples(active_goal.description)
+                examples = self.episodic_store.get_formatted_examples(
+                    active_goal.description
+                )
                 if examples:
-                    self.working_memory.scratchpad += f"\n\n[Memory Injection]\n{examples}"
+                    self.working_memory.scratchpad += (
+                        f"\n\n[Memory Injection]\n{examples}"
+                    )
 
         # 3. Planning: Generate/Refine Intentions
-        current_plan_json = self.intentions.current_plan.model_dump_json() if self.intentions.current_plan else "No active plan."
+        current_plan_json = (
+            self.intentions.current_plan.model_dump_json()
+            if self.intentions.current_plan
+            else "No active plan."
+        )
 
         plan_notification = ""
         if not self.intentions.current_plan and self.goals.active_goals:
-            plan_notification = "\n\n[System Notification]\nYou have an active goal but no plan. You MUST use the `planning` tool (command: create) to create a plan before proceeding."
+            plan_notification = (
+                "\n\n[System Notification]\nYou have an active goal but no "
+                "plan. You MUST use the `planning` tool (command: create) to "
+                "create a plan before proceeding."
+            )
         elif self.intentions.current_plan:
-             await self.intentions.refine_plan(self.beliefs, self.llm)
+            await self.intentions.refine_plan(self.beliefs, self.llm)
 
         # Sync History to Working Memory
         self.working_memory.recent_history = self.memory.messages[-10:]
@@ -240,9 +267,16 @@ Current Plan:
         # Reasoning Engine (Chapter 3)
         reasoning_strategy_output = ""
         if self.reasoning_engine:
-            context_for_reasoning = f"{bdi_context}\n\nLast User Message: {self.memory.messages[-1].content if self.memory.messages else ''}"
-            reasoning_result = await self.reasoning_engine.decide_strategy(context_for_reasoning)
-            reasoning_strategy_output = f"\n\nReasoning Engine Output:\n{reasoning_result}"
+            context_for_reasoning = (
+                f"{bdi_context}\n\nLast User Message: "
+                f"{self.memory.messages[-1].content if self.memory.messages else ''}"
+            )
+            reasoning_result = await self.reasoning_engine.decide_strategy(
+                context_for_reasoning
+            )
+            reasoning_strategy_output = (
+                f"\n\nReasoning Engine Output:\n{reasoning_result}"
+            )
 
         # Model Routing (Chapter 13)
         if self.router:
@@ -252,7 +286,9 @@ Current Plan:
             elif self.intentions.current_phase == Phase.ACTION:
                 phase = TaskPhase.CODING
 
-            selected_tier = self.router.route(phase, len(bdi_context), self.session_id)
+            selected_tier = self.router.route(
+                phase, len(bdi_context), self.session_id
+            )
             logger.info(f"Router selected model tier: {selected_tier}")
 
             config_name = self.router.get_config_for_tier(selected_tier)
@@ -270,18 +306,23 @@ Current Plan:
 
         # Update Prompt
         original_prompt = self.next_step_prompt
-        self.next_step_prompt = f"{original_prompt}\n\n{bdi_context}{reasoning_strategy_output}{plan_notification}"
+        self.next_step_prompt = (
+            f"{original_prompt}\n\n{bdi_context}"
+            f"{reasoning_strategy_output}{plan_notification}"
+        )
 
         try:
             # Delegate to ToolCallAgent.think
             result = await self.think_with_retry()
 
             if self.performance_monitor:
-                self.performance_monitor.record_step_duration(time.time() - start_time)
+                self.performance_monitor.record_step_duration(
+                    time.time() - start_time
+                )
 
             return result
         finally:
-             self.next_step_prompt = original_prompt
+            self.next_step_prompt = original_prompt
 
     async def act(self) -> str:
         """Execute actions and update beliefs (Chapter 1.3 step 4 & 5)."""
@@ -299,29 +340,43 @@ Current Plan:
             # Recovery Logic
             if self.recovery_manager and current_calls:
                 # Analyze the first tool call that likely caused the error
-                # In a multi-tool scenario, this is a simplification
                 failed_tool = current_calls[0].function.name
-                failed_args = json.loads(current_calls[0].function.arguments or "{}")
+                failed_args = json.loads(
+                    current_calls[0].function.arguments or "{}"
+                )
 
-                recovery_plan = self.recovery_manager.analyze_error(error_msg, failed_tool, failed_args)
-                logger.warning(f"Recovery Plan Triggered: {recovery_plan.category} -> {recovery_plan.strategy}")
+                recovery_plan = self.recovery_manager.analyze_error(
+                    error_msg, failed_tool, failed_args
+                )
+                logger.warning(
+                    f"Recovery Plan Triggered: {recovery_plan.category} "
+                    f"-> {recovery_plan.strategy}"
+                )
 
                 if recovery_plan.strategy == RecoveryStrategy.RETRY:
-                    # For simple retry, we return the error as observation so the LLM loops back
-                    # But we might want to automatically retry here?
-                    # The standard pattern is to return the error to the LLM so it can decide.
-                    # But we inject the recovery advice.
-                    result = f"Error: {error_msg}\n[System Advice]: {recovery_plan.reasoning}"
+                    result = (
+                        f"Error: {error_msg}\n[System Advice]: "
+                        f"{recovery_plan.reasoning}"
+                    )
 
                 elif recovery_plan.strategy == RecoveryStrategy.RETRY_WITH_DELAY:
-                    await asyncio.sleep(5) # Exponential backoff placeholder
-                    result = f"Error: {error_msg}\n[System Advice]: Operation timed out. Paused for 5s. {recovery_plan.reasoning}"
+                    await asyncio.sleep(5)  # Exponential backoff placeholder
+                    result = (
+                        f"Error: {error_msg}\n[System Advice]: Operation "
+                        f"timed out. Paused for 5s. {recovery_plan.reasoning}"
+                    )
 
                 elif recovery_plan.strategy == RecoveryStrategy.MODIFY_ARGS:
-                    result = f"Error: {error_msg}\n[System Advice]: {recovery_plan.reasoning}"
+                    result = (
+                        f"Error: {error_msg}\n[System Advice]: "
+                        f"{recovery_plan.reasoning}"
+                    )
 
                 elif recovery_plan.strategy == RecoveryStrategy.ASK_USER:
-                    result = f"Error: {error_msg}\n[System Advice]: CRITICAL FAILURE. Please ask the user for help."
+                    result = (
+                        f"Error: {error_msg}\n[System Advice]: CRITICAL "
+                        "FAILURE. Please ask the user for help."
+                    )
                 else:
                     result = f"Error: {error_msg}"
             else:
@@ -329,10 +384,6 @@ Current Plan:
 
             if self.router:
                 self.router.report_failure(self.session_id)
-
-            # We do NOT raise e here, we return the result (error description)
-            # so the agent can perceive it and re-plan in the next think() cycle.
-            # Unless it's a fatal system error.
 
         duration = time.time() - start_time
 
@@ -366,7 +417,9 @@ Current Plan:
 
             if self.episodic_store and self.current_episode_actions:
                 active_goal = self.goals.get_active_goal()
-                goal_desc = active_goal.description if active_goal else "Unknown Goal"
+                goal_desc = (
+                    active_goal.description if active_goal else "Unknown Goal"
+                )
                 episode = Episode(
                     goal=goal_desc,
                     actions=self.current_episode_actions,
@@ -389,9 +442,15 @@ Current Plan:
 
         state_data = {
             "session_id": self.session_id,
-            "status": self.state.value if hasattr(self.state, "value") else str(self.state),
+            "status": (
+                self.state.value if hasattr(self.state, "value")
+                else str(self.state)
+            ),
             "history": [msg.model_dump() for msg in self.memory.messages],
-            "plan": self.intentions.current_plan.model_dump() if self.intentions.current_plan else None,
+            "plan": (
+                self.intentions.current_plan.model_dump()
+                if self.intentions.current_plan else None
+            ),
             "beliefs": self.beliefs.model_dump(),
             "goals": self.goals.model_dump(),
             "working_memory": self.working_memory.model_dump(),
@@ -416,15 +475,18 @@ Current Plan:
 
             self.session_id = state_data.get("session_id", self.session_id)
             if "history" in state_data:
-                self.memory.messages = [Message(**msg) for msg in state_data["history"]]
+                self.memory.messages = [
+                    Message(**msg) for msg in state_data["history"]
+                ]
             if "beliefs" in state_data:
                 self.beliefs = BeliefSet(**state_data["beliefs"])
             if "goals" in state_data:
                 self.goals = GoalSet(**state_data["goals"])
             if "plan" in state_data and state_data["plan"]:
                 self.intentions.set_plan(Plan(**state_data["plan"]))
-                # Sync PlanningTool... (omitted for brevity, handled in Manus originally)
             if "working_memory" in state_data:
-                self.working_memory = WorkingMemory(**state_data["working_memory"])
+                self.working_memory = WorkingMemory(
+                    **state_data["working_memory"]
+                )
         except Exception as e:
             logger.error(f"Failed to load state: {e}")

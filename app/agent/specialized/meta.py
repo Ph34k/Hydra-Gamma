@@ -1,28 +1,33 @@
-from typing import List, Dict, Optional, Any
+from typing import Dict, Optional, Any
 from pydantic import BaseModel, Field
 from app.agent.core import AgentCore
-from app.agent.toolcall import ToolCallAgent
 from app.logger import logger
 from app.tool.file_tool import FileTool
 from app.tool.shell_tool import ShellTool
 from app.tool.python_execute import PythonExecute
-from app.metrics.performance import PerformanceMonitor
+
 
 class ImprovementHypothesis(BaseModel):
+    """Data model for a proposed improvement."""
     target_component: str
     problem_description: str
     proposed_solution: str
     confidence_score: float
 
+
 class CodePatch(BaseModel):
+    """Data model for a code patch."""
     file_path: str
-    diff_content: str # Unified diff format or just the new content for simplicity in this V1
+    diff_content: str
     description: str
 
+
 class TestResult(BaseModel):
+    """Data model for validation result."""
     passed: bool
     output: str
     error: Optional[str] = None
+
 
 class MetaProgrammerAgent(AgentCore):
     """
@@ -31,14 +36,17 @@ class MetaProgrammerAgent(AgentCore):
     validating changes in a sandbox, and deploying them.
     """
     name: str = "MetaProgrammerAgent"
-    description: str = "Self-improvement agent that analyzes code and proposes fixes."
+    description: str = "Self-improvement agent for code analysis and fixes."
 
     # Tools for code manipulation
     file_tool: FileTool = Field(default_factory=FileTool)
     shell_tool: ShellTool = Field(default_factory=ShellTool)
     python_tool: PythonExecute = Field(default_factory=PythonExecute)
 
-    def analyze_performance(self, metrics_data: Dict[str, Any]) -> Optional[ImprovementHypothesis]:
+    def analyze_performance(
+        self,
+        metrics_data: Dict[str, Any]
+    ) -> Optional[ImprovementHypothesis]:
         """
         Analyze performance metrics to identify bottlenecks.
         (Chapter 49.3 Step 1)
@@ -46,25 +54,28 @@ class MetaProgrammerAgent(AgentCore):
         logger.info("MetaProgrammer: Analyzing performance metrics...")
 
         # Heuristic: Detect high failure rate tools
-        for tool_name, failure_count in metrics_data.get("failure_counts", {}).items():
+        failure_counts = metrics_data.get("failure_counts", {})
+        for tool_name, failure_count in failure_counts.items():
             if failure_count > 3:
                 return ImprovementHypothesis(
                     target_component=f"Tool:{tool_name}",
-                    problem_description=f"High failure rate detected in tool {tool_name}",
-                    proposed_solution=f"Review error handling and input validation for {tool_name}",
+                    problem_description=f"High failure rate in {tool_name}",
+                    proposed_solution=f"Review error handling for {tool_name}",
                     confidence_score=0.8
                 )
         return None
 
-    async def propose_code_change(self, hypothesis: ImprovementHypothesis) -> Optional[CodePatch]:
+    async def propose_code_change(
+        self,
+        hypothesis: ImprovementHypothesis
+    ) -> Optional[CodePatch]:
         """
         Generate a code patch based on the hypothesis using the LLM.
         (Chapter 49.3 Step 2)
         """
-        logger.info(f"MetaProgrammer: Proposing fix for {hypothesis.target_component}")
+        logger.info(f"Proposing fix for {hypothesis.target_component}")
 
-        # Read the target file (simplified logic: assume we know the path)
-        # In a real scenario, we'd search for the file defining the tool.
+        # Read the target file
         target_file = f"app/tool/{hypothesis.target_component.split(':')[1]}.py"
         try:
             current_code = await self.file_tool.read(target_file)
@@ -77,25 +88,44 @@ class MetaProgrammerAgent(AgentCore):
         Problem: {hypothesis.problem_description}
         Solution Idea: {hypothesis.proposed_solution}
 
+        Target File: {target_file}
+
         Current Code:
         ```python
         {current_code}
         ```
 
-        Generate a unified diff or the full new code to fix this issue.
-        Focus on robustness and error handling.
+        Generate the FULL content of the fixed file. Do not use diffs.
+        Ensure you handle edge cases and import necessary modules.
         """
 
-        # Simulate LLM call (In real impl, use self.llm.generate(prompt))
-        # For this MVP, we'll return a dummy patch if this were a real run
-        # But we need the LLM to actually do this.
-        # Since I cannot invoke the LLM easily inside this synchronous logic without `await self.llm.acontext`,
-        # We will structure this to be called from the Agent's act() loop if fully autonomous.
-        # For now, we return a placeholder object.
+        if self.llm:
+            try:
+                from app.schema import Message
+                response = await self.llm.ask(
+                    messages=[Message.user_message(prompt)]
+                )
 
+                # Extract code block if present
+                content = response
+                if "```python" in content:
+                    content = content.split("```python")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                return CodePatch(
+                    file_path=target_file,
+                    diff_content=content.strip(),
+                    description=f"Fix for {hypothesis.problem_description}"
+                )
+            except Exception as e:
+                logger.error(f"MetaProgrammer LLM generation failed: {e}")
+                return None
+
+        # Fallback for tests without mocked LLM response
         return CodePatch(
             file_path=target_file,
-            diff_content="# TODO: LLM Generated Patch",
+            diff_content="# LLM Unavailable - Patch Stub",
             description=f"Fix for {hypothesis.problem_description}"
         )
 
@@ -109,27 +139,33 @@ class MetaProgrammerAgent(AgentCore):
         # 1. Create a temporary test file
         test_file = patch.file_path + ".test_ver"
         try:
-             # In reality, we'd apply the patch to a copy of the file
-             await self.file_tool.write(test_file, patch.diff_content) # Assuming full content for now
+            await self.file_tool.write(test_file, patch.diff_content)
 
-             # 2. Run syntax check
-             result = await self.shell_tool.execute(command=f"python3 -m py_compile {test_file}")
+            # 2. Run syntax check
+            cmd = f"python3 -m py_compile {test_file}"
+            result = await self.shell_tool.execute(command=cmd)
 
-             if "Error" in result or "Exception" in result:
-                 return TestResult(passed=False, output=result, error="Syntax Error")
+            if "Error" in result or "Exception" in result:
+                return TestResult(
+                    passed=False,
+                    output=result,
+                    error="Syntax Error"
+                )
 
-             # 3. Run unit tests (if available)
-             # This would require a sophisticated test runner that knows which tests cover this file.
-             return TestResult(passed=True, output="Syntax Check Passed")
+            return TestResult(passed=True, output="Syntax Check Passed")
 
         except Exception as e:
-            return TestResult(passed=False, output=str(e), error="Validation Exception")
+            return TestResult(
+                passed=False,
+                output=str(e),
+                error="Validation Exception"
+            )
         finally:
             # Cleanup
             try:
                 await self.shell_tool.execute(command=f"rm {test_file}")
-            except:
-                pass
+            except Exception:
+                pass  # Ignore cleanup errors
 
     async def deploy_change(self, patch: CodePatch) -> bool:
         """
@@ -144,7 +180,6 @@ class MetaProgrammerAgent(AgentCore):
             await self.file_tool.write(backup_path, original_content)
 
             # 2. Apply patch (Overwrite for now)
-            # In a real diff scenario, we'd use `patch` command.
             await self.file_tool.write(patch.file_path, patch.diff_content)
 
             logger.info("MetaProgrammer: Deployment successful.")
