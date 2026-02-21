@@ -1,5 +1,6 @@
 import asyncio
-from typing import List, Optional, Dict, Any
+import re
+from typing import List, Optional, Dict, Any, Tuple
 from app.llm import LLM
 from app.logger import logger
 from app.schema import Message
@@ -68,40 +69,91 @@ class ReasoningEngine:
         logger.info(f"Refined thought: {final_thought}")
         return final_thought
 
+    async def _generate_candidates(self, context: str, n: int = 3) -> List[str]:
+        """Generate N distinct candidate plans."""
+        prompt = f"""
+        Context: {context}
+
+        Generate {n} DISTINCT and VALID next steps or short-term plans to solve the current problem.
+        Ensure they are different approaches.
+
+        Format your response exactly as:
+        Option 1: [Description]
+        Option 2: [Description]
+        ...
+        """
+        response = await self.llm.ask([Message.user_message(prompt)], stream=False)
+
+        # Parse options
+        candidates = []
+        for line in response.split("\n"):
+            if line.strip().startswith("Option"):
+                candidates.append(line.split(":", 1)[1].strip())
+
+        # Fallback if parsing fails
+        if not candidates:
+            candidates = [response]
+
+        return candidates[:n]
+
+    async def _evaluate_candidates(self, context: str, candidates: List[str]) -> List[Tuple[str, float, str]]:
+        """Simulate and score candidates. Returns list of (candidate, score, simulation_log)."""
+        results = []
+        for candidate in candidates:
+            prompt = f"""
+            Context: {context}
+
+            Proposed Action: {candidate}
+
+            1. SIMULATE: Mentally simulate the execution of this action. What is the likely outcome? What are the risks?
+            2. SCORE: Assign a feasibility score from 0.0 to 10.0 based on effectiveness and safety.
+
+            Return format:
+            SCORE: [0-10]
+            SIMULATION: [Explanation]
+            """
+            eval_response = await self.llm.ask([Message.user_message(prompt)], stream=False)
+
+            score = 0.0
+            simulation = eval_response
+
+            # Extract score
+            match = re.search(r"SCORE:\s*([\d\.]+)", eval_response)
+            if match:
+                try:
+                    score = float(match.group(1))
+                except:
+                    pass
+
+            results.append((candidate, score, simulation))
+
+        return results
+
     async def tree_of_thought(self, context: str, candidates: int = 3) -> str:
         """
         Implement Tree-of-Thought: Generate multiple paths, simulate results, score them, pick the best.
+        Explicitly separates generation and evaluation.
         """
-        # 1. Generate Candidates
-        candidates_prompt = f"""
-        Context: {context}
+        logger.info("Starting Tree-of-Thought reasoning...")
 
-        Generate {candidates} distinct valid next steps or plans to solve the current problem.
-        Format them as:
-        Option 1: ...
-        Option 2: ...
-        """
-        options_text = await self.llm.ask([Message.user_message(candidates_prompt)], stream=False)
+        # 1. Generate Candidates
+        options = await self._generate_candidates(context, candidates)
+        if not options:
+            return "Unable to generate options."
 
         # 2. Simulate & Evaluate
-        # We ask the LLM to perform the simulation and scoring as part of its reasoning process
-        eval_prompt = f"""
-        Context: {context}
+        scored_options = await self._evaluate_candidates(context, options)
 
-        Proposed Options:
-        {options_text}
+        # 3. Select Best
+        best_option = max(scored_options, key=lambda x: x[1])
 
-        For each option:
-        1. Simulate the likely outcome: What happens if we take this step? What are the risks?
-        2. Assign a feasibility score (0-10) based on the simulation.
+        logger.info(f"ToT Selected: {best_option[0]} (Score: {best_option[1]})")
 
-        After analyzing all options, select the single best one.
-        Return ONLY the content of the best option (do not include the score or simulation in the final output).
+        return f"""
+        Tree of Thought Selection:
+        Selected Option: {best_option[0]}
+        Reasoning: {best_option[2]}
         """
-        best_option = await self.llm.ask([Message.user_message(eval_prompt)], stream=False)
-
-        logger.info(f"ToT Selected: {best_option}")
-        return best_option
 
     async def decide_strategy(self, context: str) -> str:
         """

@@ -17,6 +17,7 @@ class PageContent(BaseModel):
     url: str
     relevant_links: List[str]
     content: str  # text/html representation
+    captcha_detected: bool = False
 
 
 class BrowserTool(BaseTool):
@@ -25,6 +26,7 @@ class BrowserTool(BaseTool):
     A comprehensive browser tool for headless navigation and interaction.
     Encapsulates navigation, clicking, typing, and extraction.
     Supports session persistence via task_id.
+    Includes robustness features for CAPTCHA detection.
     """
     parameters: dict = {
         "type": "object",
@@ -56,7 +58,7 @@ class BrowserTool(BaseTool):
             },
             "selector": {
                 "type": "string",
-                "description": "CSS or XPath selector for interaction.",
+                "description": "CSS or XPath selector for interaction. If 'vision_needed', uses Vision model.",
             },
             "text": {
                 "type": "string",
@@ -92,7 +94,6 @@ class BrowserTool(BaseTool):
             os.makedirs(user_data_dir, exist_ok=True)
 
             # Launch persistent context
-            # We use persistent_context to keep cookies/localstorage in user_data_dir
             try:
                 self._context = await self._playwright.chromium.launch_persistent_context(
                     user_data_dir,
@@ -108,6 +109,32 @@ class BrowserTool(BaseTool):
                  self._context = await browser.new_context()
 
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+
+    async def _detect_captcha(self) -> bool:
+        """Simple heuristic for CAPTCHA detection."""
+        try:
+            content = await self._page.content()
+            if "captcha" in content.lower() or "recaptcha" in content.lower() or "cloudflare" in content.lower():
+                # Verify if it's visible or blocking
+                # This is a simplification; robust detection would need more checks
+                return True
+        except:
+            pass
+        return False
+
+    async def _resolve_selector_with_vision(self, description: str) -> Optional[str]:
+        """
+        Stub for Vision-based selector resolution (Chapter 21.3).
+        Takes a screenshot and asks a Vision Model to locate the element.
+        """
+        # 1. Take screenshot
+        screenshot_bytes = await self._page.screenshot()
+        # 2. Call Vision Model (e.g., GPT-4o) with image + description
+        # 3. Model returns coordinates or improved selector
+
+        # Placeholder implementation
+        logger.info(f"Vision selector resolution requested for: {description}")
+        return None # Not fully implemented without Vision API key in this context
 
     async def execute(
         self,
@@ -126,6 +153,22 @@ class BrowserTool(BaseTool):
                 await self._ensure_initialized(task_id)
                 if not self._page:
                     return ToolResult(error="Browser page not initialized")
+
+                # Check for CAPTCHA before any action
+                if await self._detect_captcha():
+                     return ToolResult(
+                         error="CAPTCHA detected. User intervention required.",
+                         output="Please solve the CAPTCHA manually or use a different source."
+                     )
+
+                # Vision Selector Handling
+                if selector and selector.startswith("vision:"):
+                    vision_selector = await self._resolve_selector_with_vision(selector[7:])
+                    if vision_selector:
+                        selector = vision_selector
+                    else:
+                        # Fallback or error
+                        pass # proceed with original string maybe it's valid, or fail
 
                 if action == "navigate":
                     if not url:
@@ -164,36 +207,24 @@ class BrowserTool(BaseTool):
             if not response:
                  return ToolResult(error="Navigation failed, no response")
 
-            # Check for 401 or login redirect (Session Expiration Logic)
             if response.status == 401 or "login" in response.url:
-                 # In a real agent, we might signal this differently.
                  logger.warning(f"Possible session expiration/login required at {url}")
 
-            # Pre-processing: Remove irrelevant tags
             await self._page.evaluate("""() => {
                 const elements = document.querySelectorAll('script, style, meta, noscript, iframe');
                 elements.forEach(el => el.remove());
             }""")
 
-            # Extract content
             content = await self._page.content()
-
-            # Extract relevant links
             links = await self._page.evaluate("""() => {
                 return Array.from(document.querySelectorAll('a[href]'))
                     .map(a => a.href)
-                    .slice(0, 50); // Limit links
+                    .slice(0, 50);
             }""")
 
-            # Optimization with Focus
             if focus:
-                # If focus is provided, use LLM or basic extraction to narrow down content
-                # For efficiency, we first get visible text
                 text_content = await self._page.evaluate("document.body.innerText")
-
-                # Truncate if too long for LLM
                 truncated_text = text_content[:10000]
-
                 prompt = f"""
                 Analyze the following web page content and extract the section relevant to: "{focus}".
                 Return only the relevant text.
@@ -201,20 +232,18 @@ class BrowserTool(BaseTool):
                 Content:
                 {truncated_text}
                 """
-                # Use LLM to summarize/extract
-                # We need to use self.llm.ask()
                 try:
                     summary = await self.llm.ask([{"role": "user", "content": prompt}])
                     content = summary
                 except Exception as llm_e:
                     logger.warning(f"LLM extraction failed: {llm_e}")
-                    content = text_content[:2000] # Fallback
+                    content = text_content[:2000]
             else:
-                 # Default: return text content
                  content = await self._page.evaluate("document.body.innerText")
-                 content = content[:5000] # Limit default output
+                 content = content[:5000]
 
-            page_content = PageContent(url=self._page.url, relevant_links=links, content=content)
+            captcha = await self._detect_captcha()
+            page_content = PageContent(url=self._page.url, relevant_links=links, content=content, captcha_detected=captcha)
 
             return ToolResult(output=page_content.model_dump_json(indent=2))
 
@@ -237,7 +266,6 @@ class BrowserTool(BaseTool):
 
     async def _screenshot(self, path: str) -> ToolResult:
         try:
-            # Ensure directory exists
             os.makedirs(os.path.dirname(path), exist_ok=True)
             await self._page.screenshot(path=path)
             return ToolResult(output=f"Screenshot saved to {path}")
