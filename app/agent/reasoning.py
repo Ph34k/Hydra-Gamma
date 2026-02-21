@@ -70,7 +70,7 @@ class ReasoningEngine:
 
     async def tree_of_thought(self, context: str, candidates: int = 3) -> str:
         """
-        Implement Tree-of-Thought: Generate multiple paths, score them, pick the best.
+        Implement Tree-of-Thought: Generate multiple paths, simulate results, score them, pick the best.
         """
         # 1. Generate Candidates
         candidates_prompt = f"""
@@ -83,18 +83,20 @@ class ReasoningEngine:
         """
         options_text = await self.llm.ask([Message.user_message(candidates_prompt)], stream=False)
 
-        # 2. Evaluate Candidates
+        # 2. Simulate & Evaluate
+        # We ask the LLM to perform the simulation and scoring as part of its reasoning process
         eval_prompt = f"""
         Context: {context}
 
-        Options:
+        Proposed Options:
         {options_text}
 
-        Evaluate each option for feasibility, efficiency, and correctness.
-        Assign a score from 0-10 to each.
-        Select the best option.
+        For each option:
+        1. Simulate the likely outcome: What happens if we take this step? What are the risks?
+        2. Assign a feasibility score (0-10) based on the simulation.
 
-        Return the content of the best option ONLY.
+        After analyzing all options, select the single best one.
+        Return ONLY the content of the best option (do not include the score or simulation in the final output).
         """
         best_option = await self.llm.ask([Message.user_message(eval_prompt)], stream=False)
 

@@ -356,8 +356,8 @@ class Manus(ToolCallAgent):
         if not self.intentions.current_plan and self.goals.active_goals:
             plan_notification = "\n\n[System Notification]\nYou have an active goal but no plan. You MUST use the `planning` tool (command: create) to create a plan before proceeding."
         elif self.intentions.current_plan:
-             # Check if we should refine or advance
-             pass
+             # Refine plan based on new beliefs (Reactive Planning)
+             await self.intentions.refine_plan(self.beliefs, self.llm)
 
         # Update Working Memory History (syncing with agent memory)
         self.working_memory.recent_history = self.memory.messages[-10:] # Keep last 10 in working memory view
@@ -472,7 +472,7 @@ Current Plan:
                 self.current_episode_actions.append(action)
 
         # 5. Observation (Post-Act): Update beliefs with the result of the action
-        self.beliefs.update_from_observation(result)
+        await self.beliefs.update_from_observation(result, self.llm)
         self.working_memory.add_observation(result)
 
         # 6. Evaluate Progress
