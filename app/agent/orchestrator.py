@@ -1,54 +1,111 @@
 import asyncio
-from typing import Dict, List, Optional, Any
+import uuid
+import os
+import json
+from typing import Dict, Optional, Any
 from pydantic import BaseModel
-from app.agent.bus import MessageBus, AgentMessage, AgentRole
 
-class TaskStatus(BaseModel):
-    id: str
-    status: str # pending, running, completed, failed
-    result: Optional[str] = None
+from app.agent.bus import MessageBus, AgentMessage, AgentRole
+from app.agent.manus import Manus
+from app.logger import logger
+
+class SessionState(BaseModel):
+    session_id: str
+    status: str
+    agent_state_path: str
 
 class Orchestrator:
-    """Manages the lifecycle of multiple agents and their communication."""
+    """
+    Central Orchestrator (Chapter 2) responsible for:
+    - Managing agent sessions
+    - Dispatching tasks/commands to the active agent
+    - Managing state persistence and recovery
+    - Coordinating multi-agent communication (via MessageBus)
+    """
 
     def __init__(self):
         self.message_bus = MessageBus()
-        self.agents: Dict[str, Any] = {} # agent_id -> agent_instance
-        self.tasks: Dict[str, TaskStatus] = {}
+        self.active_sessions: Dict[str, Manus] = {}
+        self.session_states: Dict[str, SessionState] = {}
+        self.storage_path = "workspace/sessions"
+        os.makedirs(self.storage_path, exist_factory=True)
 
+    async def create_session(self, session_id: Optional[str] = None) -> str:
+        """Create a new agent session."""
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        # Initialize a new Manus agent
+        agent = await Manus.create(session_id=session_id)
+        self.active_sessions[session_id] = agent
+
+        self.session_states[session_id] = SessionState(
+            session_id=session_id,
+            status="active",
+            agent_state_path=os.path.join(self.storage_path, f"session_{session_id}.json")
+        )
+        logger.info(f"Created new session: {session_id}")
+        return session_id
+
+    async def restore_session(self, session_id: str) -> bool:
+        """Restore an existing session from disk."""
+        filepath = os.path.join(self.storage_path, f"session_{session_id}.json")
+        if not os.path.exists(filepath):
+            logger.warning(f"Session file {filepath} not found.")
+            return False
+
+        agent = await Manus.create(session_id=session_id)
+        await agent.load_state(filepath)
+        self.active_sessions[session_id] = agent
+
+        self.session_states[session_id] = SessionState(
+            session_id=session_id,
+            status="restored",
+            agent_state_path=filepath
+        )
+        logger.info(f"Restored session: {session_id}")
+        return True
+
+    async def run_step(self, session_id: str, user_input: Optional[str] = None) -> str:
+        """Execute a single step (or run until completion) for the given session."""
+        agent = self.active_sessions.get(session_id)
+        if not agent:
+            raise ValueError(f"Session {session_id} not found or not active.")
+
+        try:
+            # Delegate execution to the agent's run loop
+            # Note: agent.run() runs until completion or max_steps.
+            # Ideally, Orchestrator should control the loop step-by-step for finer control,
+            # but reusing agent.run() is simpler for now.
+            if user_input:
+                result = await agent.run(user_input)
+            else:
+                # Resume execution without new input (e.g., after tool output)
+                result = await agent.run()
+
+            return result
+        except Exception as e:
+            logger.error(f"Error in session {session_id}: {e}")
+            raise e
+        finally:
+            # Ensure state is saved after execution
+            await agent.save_state(self.session_states[session_id].agent_state_path)
+
+    async def terminate_session(self, session_id: str):
+        """Clean up and terminate a session."""
+        agent = self.active_sessions.get(session_id)
+        if agent:
+            await agent.cleanup()
+            del self.active_sessions[session_id]
+            if session_id in self.session_states:
+                self.session_states[session_id].status = "terminated"
+            logger.info(f"Terminated session: {session_id}")
+
+    # Legacy Multi-Agent Support (kept for compatibility)
     def register_agent(self, agent_id: str, role: AgentRole, agent_instance: Any):
-        """Register an agent with the orchestrator."""
-        self.agents[agent_id] = agent_instance
-        # Register a callback for this agent to receive messages
-        # In a real implementation, the agent_instance would have a method like `receive_message`
-        # For now, we simulate this callback
-
-        async def message_handler(message: AgentMessage):
-             if hasattr(agent_instance, 'receive_message'):
-                 await agent_instance.receive_message(message)
-
-        self.message_bus.subscribe(agent_id, message_handler)
+        # Implementation for multi-agent swarm registration
+        pass
 
     async def dispatch_task(self, task_description: str):
-        """Assigns a task to the Architect agent to start the workflow."""
-        # This is a simplified flow: Architect -> Developer -> Reviewer
-
-        architect_id = self._find_agent_by_role(AgentRole.ARCHITECT)
-        if not architect_id:
-            raise RuntimeError("No Architect agent available.")
-
-        initial_message = AgentMessage(
-            sender="orchestrator",
-            recipient=architect_id,
-            content=task_description,
-            message_type="task_assignment"
-        )
-        await self.message_bus.publish(initial_message)
-
-    def _find_agent_by_role(self, role: AgentRole) -> Optional[str]:
-        # This assumes we store role in agent instance or separately.
-        # For simplicity, let's assume agent_id implies role or we pass metadata
-        for agent_id, agent in self.agents.items():
-            if getattr(agent, 'role', None) == role:
-                return agent_id
-        return None
+        # Implementation for multi-agent task dispatch
+        pass

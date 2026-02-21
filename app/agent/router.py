@@ -10,9 +10,9 @@ class TaskPhase(Enum):
     EXTRACTION = auto()
 
 class ModelTier(Enum):
-    TIER_1 = "gpt-4-opus" # High Intelligence
-    TIER_2 = "gpt-4o-mini" # Fast/Cheap
-    TIER_3 = "llama-3" # Local/Budget
+    TIER_1 = "smart" # High Intelligence (e.g. GPT-4o, Claude 3.5 Sonnet)
+    TIER_2 = "fast"  # Fast/Cheap (e.g. GPT-4o-mini, Haiku)
+    TIER_3 = "local" # Local/Budget (e.g. Llama 3)
 
 class Router:
     """Decides which model to use based on task complexity and phase."""
@@ -55,3 +55,13 @@ class Router:
     def reset_history(self, task_id: str):
         if task_id in self.error_history:
             del self.error_history[task_id]
+
+    def get_config_for_tier(self, tier: ModelTier) -> str:
+        """Map ModelTier to LLM config name."""
+        if tier == ModelTier.TIER_1:
+            return "default" # Usually the best model is default
+        elif tier == ModelTier.TIER_2:
+            return "fast" # Configure 'fast' in config.toml
+        elif tier == ModelTier.TIER_3:
+            return "local"
+        return "default"
