@@ -1,6 +1,9 @@
 import os
 import re
 import json
+import ast
+import shutil
+import tempfile
 from typing import List, Optional, Dict, Any
 
 from pydantic import Field
@@ -17,7 +20,7 @@ class MetaProgrammerAgent(Manus):
     """
     The Meta-Programmer Agent (Chapter 49).
     Responsible for self-evolution, performance analysis, and code improvement.
-    Enhanced with concrete analysis and proposal capabilities.
+    Enhanced with concrete analysis, validation, and deployment capabilities.
     """
     name: str = "meta_programmer_agent"
     description: str = "An advanced agent that can analyze and improve its own codebase."
@@ -58,9 +61,6 @@ class MetaProgrammerAgent(Manus):
                 elif "WARNING" in line:
                     metrics["warnings"] += 1
 
-            # Identify slow tool calls (if any structured logs exist)
-            # This is a placeholder for more complex log parsing
-
             analysis_result = {
                 "metrics": metrics,
                 "critical_issues": issues[:10], # Top 10 errors
@@ -83,7 +83,8 @@ class MetaProgrammerAgent(Manus):
             with open(file_path, 'r') as f:
                 code_content = f.read()
 
-            # Use the LLM to generate a patch
+            # Use the LLM to generate a full file replacement or a diff
+            # For robustness, we ask for the full new content of the file
             prompt = f"""
             You are the Meta-Programmer.
             I have identified an issue in `{file_path}`:
@@ -94,22 +95,64 @@ class MetaProgrammerAgent(Manus):
             {code_content}
             ```
 
-            Please provide a unified diff or a rewritten version of the code to fix this issue.
-            Focus on performance, safety, and maintainability.
+            Please provide the FULL corrected content of the file in a python code block.
+            Ensure syntax is correct.
             """
 
-            # Use the agent's LLM to generate the response
-            # We access the LLM directly here, assuming it's initialized
             response = await self.llm.ask(prompt)
-            return response
+
+            # Extract code from markdown block
+            code_match = re.search(r"```python\n(.*?)```", response, re.DOTALL)
+            if code_match:
+                return code_match.group(1)
+
+            return response # Fallback: return raw response (might fail validation)
 
         except Exception as e:
             logger.error(f"MetaProgrammer: Failed to propose change: {e}")
             return f"Error: {e}"
 
+    def validate_change(self, new_code: str) -> bool:
+        """
+        Validate the syntax of the proposed code change.
+        (Chapter 49.5: Riscos e Salvaguardas)
+        """
+        try:
+            ast.parse(new_code)
+            return True
+        except SyntaxError as e:
+            logger.error(f"MetaProgrammer: Proposed code has syntax error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"MetaProgrammer: Validation failed: {e}")
+            return False
+
+    def deploy_change(self, file_path: str, new_code: str) -> bool:
+        """
+        Deploy the validated change to the codebase.
+        Includes backup mechanism.
+        """
+        backup_path = f"{file_path}.bak"
+        try:
+            # Create backup
+            shutil.copy2(file_path, backup_path)
+
+            # Write new code
+            with open(file_path, 'w') as f:
+                f.write(new_code)
+
+            logger.info(f"MetaProgrammer: Deployed change to {file_path}. Backup at {backup_path}")
+            return True
+        except Exception as e:
+            logger.error(f"MetaProgrammer: Failed to deploy change: {e}")
+            # Restore backup if possible
+            if os.path.exists(backup_path):
+                shutil.copy2(backup_path, file_path)
+            return False
+
     async def run_self_improvement_cycle(self, log_path: str = "app.log"):
         """
-        Orchestrate the self-improvement loop.
+        Orchestrate the full self-improvement loop.
         (Chapter 49.2: Ciclo de Auto-Melhoria)
         """
         logger.info("MetaProgrammer: Starting self-improvement cycle...")
@@ -119,20 +162,34 @@ class MetaProgrammerAgent(Manus):
         logger.info(f"MetaProgrammer: Analysis complete. Found {analysis.get('metrics', {}).get('errors', 0)} errors.")
 
         if analysis.get('metrics', {}).get('errors', 0) > 0:
-            # 2. Identify Issue (take the first one for now)
+            # 2. Identify Issue
             issue = analysis['critical_issues'][0]
 
-            # Extract file path from log if possible (very naive heuristic)
-            # In a real system, logs would have structured context
-            # Here we assume a hypothetical file for demonstration if not found
+            # Heuristic target file selection
             target_file = "app/agent/core.py"
+            if "sandbox" in issue.lower():
+                target_file = "app/sandbox/docker.py"
 
-            logger.info(f"MetaProgrammer: Targeting {target_file} for improvement based on: {issue}")
+            logger.info(f"MetaProgrammer: Targeting {target_file} based on: {issue}")
 
             # 3. Propose Change
-            proposal = await self.propose_code_change(target_file, issue)
-            logger.info(f"MetaProgrammer: Generated proposal:\n{proposal[:200]}...")
+            new_code = await self.propose_code_change(target_file, issue)
 
-            return proposal
+            if not new_code or "Error" in new_code:
+                logger.warning("MetaProgrammer: Failed to generate valid code.")
+                return "Failed to generate code."
+
+            # 4. Validate
+            if self.validate_change(new_code):
+                logger.info("MetaProgrammer: Code validation passed.")
+
+                # 5. Deploy (In a real scenario, run tests before deploy)
+                if self.deploy_change(target_file, new_code):
+                    return f"Successfully patched {target_file}"
+                else:
+                    return "Deployment failed."
+            else:
+                logger.warning("MetaProgrammer: Code validation failed.")
+                return "Validation failed."
 
         return "No critical issues found to improve."
