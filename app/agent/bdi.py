@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 import datetime
 import json
 from app.schema import Message
+from app.logger import logger
 
 class Fact(BaseModel):
     content: str
@@ -15,24 +16,44 @@ class BeliefSet(BaseModel):
     environment_snapshot: Dict[str, Any] = Field(default_factory=dict)
     max_facts: int = 50 # Limit number of facts to store
 
-    def update_from_observation(self, observation: str):
-        self.add_fact(Fact(content=observation))
+    async def update_from_observation(self, observation: str, llm: Optional[Any] = None):
+        await self.add_fact(Fact(content=observation), llm)
 
-    def add_fact(self, fact: Union[str, Fact]):
+    async def add_fact(self, fact: Union[str, Fact], llm: Optional[Any] = None):
         if isinstance(fact, str):
             fact_obj = Fact(content=fact)
         else:
             fact_obj = fact
 
         self.facts.append(fact_obj)
-        self.prune_facts()
+        await self.prune_facts(llm)
 
-    def prune_facts(self):
+    async def prune_facts(self, llm: Optional[Any] = None):
         """Keep only the most recent facts to avoid context overflow."""
-        # Simple sliding window for now as per Bible 4.2 (L2 Memory)
         if len(self.facts) > self.max_facts:
-            # TODO: In future, use LLM to summarize older facts into L3 memory
-            self.facts = self.facts[-self.max_facts:]
+            if llm:
+                # Summarize the oldest facts (chunk)
+                num_to_summarize = len(self.facts) - self.max_facts + 5 # Summarize a chunk + 5 buffer
+                if num_to_summarize > len(self.facts) // 2:
+                     num_to_summarize = len(self.facts) // 2
+
+                to_summarize = self.facts[:num_to_summarize]
+                kept_facts = self.facts[num_to_summarize:]
+
+                prompt = f"""
+                Summarize the following older facts into a single concise fact to save space.
+                Facts:
+                {json.dumps([f.content for f in to_summarize], default=str)}
+                """
+                try:
+                    summary = await llm.ask([Message.user_message(prompt)], stream=False)
+                    summary_fact = Fact(content=f"Summary of past events: {summary}", source="summary")
+                    self.facts = [summary_fact] + kept_facts
+                except Exception as e:
+                    logger.error(f"Fact summarization failed: {e}")
+                    self.facts = self.facts[-self.max_facts:] # Fallback
+            else:
+                self.facts = self.facts[-self.max_facts:]
 
     def sync_with_environment(self, snapshot: Dict[str, Any]):
         self.environment_snapshot.update(snapshot)
@@ -205,6 +226,67 @@ class IntentionPool(BaseModel):
             print(f"Plan generation failed: {e}")
             return None
 
-    def refine_plan(self):
-        # Placeholder for plan refinement logic
-        pass
+    async def refine_plan(self, beliefs: BeliefSet, llm: Any):
+        """
+        Refine future phases of the current plan based on new beliefs.
+        Does not change the current phase or the global structure (number/order of phases),
+        but can update descriptions and titles of future phases.
+        """
+        if not self.current_plan:
+            return
+
+        # Get future phases
+        current_phase_index = -1
+        if self.current_plan.current_phase_id:
+             for i, p in enumerate(self.current_plan.phases):
+                 if p.id == self.current_plan.current_phase_id:
+                     current_phase_index = i
+                     break
+
+        future_phases = self.current_plan.phases[current_phase_index+1:]
+        if not future_phases:
+            return
+
+        prompt = f"""
+        Review the future phases of the current plan and refine them based on the latest observations.
+        You may update the description or title to be more specific, but DO NOT change the number of phases or their IDs.
+
+        Current Plan Context:
+        Goal: {self.current_plan.goal}
+        Current Phase: {self.current_plan.phases[current_phase_index].title if current_phase_index >= 0 else "Not Started"}
+
+        Future Phases to Refine:
+        {json.dumps([p.model_dump() for p in future_phases], indent=2)}
+
+        Latest Beliefs (Observations):
+        {beliefs.get_summary()}
+
+        Return a JSON array of objects with 'id', 'title', and 'description' for the refined phases.
+        Example:
+        [
+            {{"id": 2, "title": "New Title", "description": "New more detailed description"}}
+        ]
+        """
+
+        try:
+            response = await llm.ask([Message.user_message(prompt)], stream=False)
+            clean_response = response.replace("```json", "").replace("```", "").strip()
+             # Handle potential markdown wrapping or text around json
+            if "[" in clean_response and "]" in clean_response:
+                start = clean_response.find("[")
+                end = clean_response.rfind("]") + 1
+                clean_response = clean_response[start:end]
+
+            refined_phases_data = json.loads(clean_response)
+
+            # Update plan in place
+            for new_p in refined_phases_data:
+                for existing_p in self.current_plan.phases:
+                    if existing_p.id == new_p.get("id"):
+                        existing_p.title = new_p.get("title", existing_p.title)
+                        existing_p.description = new_p.get("description", existing_p.description)
+
+            logger.info("Plan refined successfully.")
+
+        except Exception as e:
+            logger.error(f"Plan refinement failed: {e}")
